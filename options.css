@@ -1,0 +1,8 @@
+:root{color-scheme:dark;font-family:Arial,sans-serif;background:#181818;color:#e6e6e6}
+body{margin:0;padding:40px 20px;background:#181818}
+.panel{max-width:720px;margin:0 auto;background:#222;border:1px solid #494949;border-radius:12px;padding:26px 28px;box-sizing:border-box}
+h1{font-size:22px;margin:0 0 4px;color:#f0f0f0}.subtitle{margin:0 0 26px;color:#aaa}
+.setting{display:flex;gap:14px;padding:18px 0;border-top:1px solid #393939;cursor:pointer}.setting:first-of-type{border-top:0}
+.setting input{width:18px;height:18px;margin-top:2px;accent-color:#8a8a8a}.setting span{display:flex;flex-direction:column;gap:6px}
+.setting strong{font-size:15px;font-weight:600;color:#e8e8e8}.setting small{font-size:13px;line-height:1.5;color:#aaa;max-width:620px}
+.status{height:18px;margin-top:12px;font-size:12px;color:#aaa}

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Chat Context Exporter — Настройки</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="panel">
+    <h1>Chat Context Exporter</h1>
+    <p class="subtitle">Настройки</p>
+
+    <label class="setting">
+      <input id="autoSaveExport" type="checkbox">
+      <span>
+        <strong>Автоматически сохранять экспорт</strong>
+        <small>После успешной проверки Markdown автоматически сохраняется в папку загрузок браузера. Если выключено, появляется кнопка «Сохранить» с выбором места.</small>
+      </span>
+    </label>
+
+    <label class="setting">
+      <input id="saveDiagnosticLog" type="checkbox">
+      <span>
+        <strong>Сохранять диагностический лог</strong>
+        <small>После каждого запуска диагностический .log автоматически сохраняется в папку загрузок браузера. В стандартной Windows это обычно C:\Users\&lt;имя пользователя&gt;\Downloads. Если папка загрузок изменена в настройках Chrome, лог сохраняется в нее. Текст переписки в лог не записывается.</small>
+      </span>
+    </label>
+
+    <div id="status" class="status" aria-live="polite"></div>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

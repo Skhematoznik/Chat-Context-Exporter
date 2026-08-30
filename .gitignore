@@ -1,0 +1,16 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local diagnostics and exported chats
+Chat Context Exporter - *.txt
+НЕПОЛНЫЙ - *.md
+
+# Release/build scratch
+*.zip
+*.crx
+*.pem
+release/
+dist/
