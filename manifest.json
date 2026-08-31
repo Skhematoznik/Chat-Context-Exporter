@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chat Context Exporter",
-  "version": "1.0.25",
+  "version": "1.0.26",
   "description": "Экспортирует ChatGPT в Markdown: строгая полнота, безопасная сериализация noncanonical turn-slot, работа без TOC и диагностический лог.",
   "permissions": [
     "activeTab",
