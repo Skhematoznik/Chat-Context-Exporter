@@ -1,0 +1,79 @@
+name: Сообщить об ошибке
+description: Воспроизводимая ошибка Chat Context Exporter
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Используйте этот шаблон только для воспроизводимых ошибок.
+        Не публикуйте приватные чаты, логи или MHTML, если они содержат конфиденциальные данные.
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия расширения
+      placeholder: "1.0.25"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: Итог экспорта
+      options:
+        - COMPLETE
+        - INCOMPLETE
+        - Экспорт не завершился
+        - Другое
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что произошло
+      description: Опишите фактический результат и почему считаете его ошибочным.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что ожидалось
+      description: Опишите ожидаемое поведение.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Как воспроизвести
+      description: Последовательность действий, длина/тип чата, переключение вкладок и другие существенные условия.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Диагностические материалы
+      description: |
+        При необходимости приложите диагностический лог, НЕПОЛНЫЙ Markdown и MHTML.
+        Перед публикацией проверьте их на наличие конфиденциальной информации.
+
+  - type: checkboxes
+    id: browser
+    attributes:
+      label: Браузер
+      options:
+        - label: Ошибка воспроизводится в Google Chrome
+          required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Проверка приватности
+      options:
+        - label: Я проверил приложенные материалы и понимаю, что Issue является публичным
+          required: true
