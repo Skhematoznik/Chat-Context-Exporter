@@ -1,7 +1,8 @@
 const SUPPORTED_HOSTS = new Set(["chatgpt.com", "chat.openai.com"]);
 const DEFAULT_SETTINGS = Object.freeze({
   autoSaveExport: true,
-  saveDiagnosticLog: false
+  saveDiagnosticLog: false,
+  useDomBackup: false
 });
 
 const MENU_AUTO_SAVE = "chat-context-exporter:auto-save";
@@ -19,7 +20,7 @@ chrome.runtime.onStartup.addListener(async () => {
 
 chrome.storage.onChanged.addListener(async (changes, areaName) => {
   if (areaName !== "local") return;
-  if (changes.autoSaveExport || changes.saveDiagnosticLog) {
+  if (changes.autoSaveExport || changes.saveDiagnosticLog || changes.useDomBackup) {
     await syncContextMenus();
   }
 });
@@ -53,7 +54,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      files: ["exporter.js"]
+      files: ["conversation-source.js", "exporter.js"]
     });
 
     await chrome.scripting.executeScript({

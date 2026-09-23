@@ -1,14 +1,24 @@
 (() => {
-  const VERSION = "1.0.25";
+  const VERSION = "1.0.39";
   if (globalThis.__ChatGPTConversationExporter?.version === VERSION) return;
 
   const MESSAGE_SELECTOR = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
   const TURN_SELECTOR = '[data-testid^="conversation-turn-"]';
   const ROOT_SENTINEL_SELECTOR = '[data-turn-id-container="client-created-root"]';
   const TURN_CONTAINER_SELECTOR = '[data-turn-id-container]';
-  const DEFAULT_SETTINGS = Object.freeze({ autoSaveExport: true, saveDiagnosticLog: false });
+  const DEFAULT_SETTINGS = Object.freeze({ autoSaveExport: true, saveDiagnosticLog: false, useDomBackup: false });
 
-  const CONFIG = Object.freeze({
+  let runtimeSettings = { ...DEFAULT_SETTINGS };
+
+chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS)).then((stored) => {
+  runtimeSettings = { ...DEFAULT_SETTINGS, ...stored };
+});
+
+function shouldUseDomBackup() {
+  return Boolean(runtimeSettings.useDomBackup);
+}
+
+const CONFIG = Object.freeze({
     initialUpwardStepRatio: 0.58,
     minUpwardStepRatio: 0.36,
     maxUpwardStepRatio: 0.92,
@@ -1837,7 +1847,7 @@
     ];
     for (const entry of state.logEntries) {
       const { t, elapsedMs: e, type, ...fields } = entry;
-      const details = Object.entries(fields).map(([k,v]) => `${k}=${Array.isArray(v) ? v.join(",") : String(v)}`).join("; ");
+      const details = Object.entries(fields).map(([k,v]) => `${k}=${Array.isArray(v) ? v.join(",") : (v && typeof v === "object" ? JSON.stringify(v) : String(v))}`).join("; ");
       lines.push(`${new Date(t).toISOString()}\t${formatDuration(e)}\t${type}\t${details}`);
     }
     return `${lines.join("\n")}\n`;
@@ -3201,26 +3211,26 @@
 
   function appendResolvedTurnSlotMarkdown(lines, turnId) {
     if (state.confirmedEmptyTurnIds.has(turnId)) {
-      lines.push(`<!-- noncanonical-turn: ${turnId} type: EMPTY_OR_ABORTED -->`, "");
+
       return false;
     }
     const slot = state.resolvedNoncanonicalTurns.get(turnId);
     if (!slot) {
-      lines.push(`<!-- unresolved-turn: ${turnId} -->`, "");
+
       return false;
     }
     if (slot.type === "PROCESSING_ONLY") {
-      lines.push(`<!-- noncanonical-turn: ${turnId} role: assistant type: PROCESSING_ONLY -->`, "", "**ChatGPT — обработка**", "");
+      lines.push("**ChatGPT — обработка**", "");
       if (slot.label) lines.push(`*${slot.label}*`, "");
       return true;
     }
     if (slot.type === "AUXILIARY_ASSISTANT") {
-      lines.push(`<!-- noncanonical-turn: ${turnId} role: assistant type: AUXILIARY_ASSISTANT -->`, "", "**ChatGPT — промежуточное сообщение**", "");
+      lines.push("**ChatGPT — промежуточное сообщение**", "");
       if (slot.label) lines.push(`*${slot.label}*`, "");
       if (slot.markdown) lines.push(slot.markdown, "");
       return true;
     }
-    lines.push(`<!-- noncanonical-turn: ${turnId} type: ${slot.type || "UNKNOWN"} -->`, "");
+
     return false;
   }
 
@@ -3296,8 +3306,8 @@
         lines.push(`*${record.dateLabel}*`, "");
         lastDate = record.dateLabel;
       }
-      lines.push(`<!-- conversation-message: ${index + 1} role: ${record.role} message-id: ${record.messageId}${record.turnId ? ` turn-id: ${record.turnId}` : ""}${Number.isFinite(record.lastObservedTurnIndex) ? ` observed-turn: ${record.lastObservedTurnIndex}` : ""} -->`, "");
       lines.push(record.role === "user" ? "**Пользователь**" : "**ChatGPT**", "");
+      if (record.messageDateLabel) lines.push(`*${record.messageDateLabel}*`, "");
       if (record.role === "assistant" && (record.processing || []).length) {
         lines.push("**Промежуточные сообщения ChatGPT**", "");
         for (const item of record.processing) {
@@ -3334,35 +3344,11 @@
     if (incomplete && leftovers.length) {
       lines.push("---", "", "## Несшитые сообщения", "", "> Ниже приведены сообщения, найденные во время сканирования, но не вошедшие в доказанную непрерывную последовательность.", "");
       for (const record of leftovers.sort((a,b) => (a.lastSeenAt || 0) - (b.lastSeenAt || 0))) {
-        lines.push(`<!-- unstitched role: ${record.role} message-id: ${record.messageId}${record.turnId ? ` turn-id: ${record.turnId}` : ""} -->`, "", record.role === "user" ? "**Пользователь**" : "**ChatGPT**", "");
+        lines.push(record.role === "user" ? "**Пользователь**" : "**ChatGPT**", "");
         if (record.markdown) lines.push(record.markdown, "");
       }
     }
 
-    lines.push("---", "", "<!--",
-      "Chat Context Exporter",
-      `Version: ${VERSION}`,
-      `Export status: ${incomplete ? "INCOMPLETE" : "COMPLETE"}`,
-      `Expected prompt groups (TOC): ${state.expectedPromptCount ?? "unknown"}`,
-      `Collected prompt groups: ${validation.collectedPromptGroups ?? promptGroupCount()}`,
-      `Connected prompt groups: ${validation.connectedPromptGroups ?? promptGroupCount(validation.chainRecords)}`,
-      `Connected canonical messages: ${validation.chain.ids.length}`,
-      `Unique canonical message-id: ${state.records.size}`,
-      `User canonical messages: ${validation.roleCounts.user}`,
-      `Assistant canonical messages: ${validation.roleCounts.assistant}`,
-      `Turn skeleton slots: ${validation.skeleton?.total ?? state.lastSkeletonStats?.total ?? "unknown"}`,
-      `Resolved turn slots: ${validation.skeleton?.resolvedSlots ?? state.lastSkeletonStats?.resolvedSlots ?? "unknown"}`,
-      `Processing-only turn slots: ${validation.skeleton?.processingOnlySlots ?? 0}`,
-      `Auxiliary assistant turn slots: ${validation.skeleton?.auxiliaryAssistantSlots ?? 0}`,
-      `Empty/aborted turn slots: ${validation.skeleton?.emptySlots ?? state.confirmedEmptyTurnIds.size}`,
-      `Unresolved turn slots: ${validation.skeleton?.unresolvedSlots ?? state.lastSkeletonStats?.unresolvedSlots ?? "unknown"}`,
-      `Serialized noncanonical turn slots: ${serializedNoncanonical.size}`,
-      `Processing details: ${validation.aux.processingCaptured}/${validation.aux.processingFound}`,
-      `Generated artifacts: ${validation.aux.artifacts}`,
-      `Elapsed: ${formatDuration(elapsedMs())}`,
-      `Exported at: ${nowIso()}`,
-      "-->"
-    );
     if (serializedNoncanonicalOut instanceof Set) {
       serializedNoncanonicalOut.clear();
       for (const turnId of serializedNoncanonical) serializedNoncanonicalOut.add(turnId);
@@ -3448,6 +3434,7 @@
   async function resetRunState({ fresh = false } = {}) {
     state.cancelRequested = false;
     state.records.clear();
+    state.apiSource = false;
     state.observations.clear();
     state.edgeCounts.clear();
     state.auxiliaryVisitedIds.clear();
@@ -3531,11 +3518,66 @@
 
     try {
       await resetRunState({ fresh });
+
+      // 1.0.39 API export pipeline.
+      let apiExportLoaded = false;
+      try {
+        const source = globalThis.__ChatContextConversationSource;
+        if (source && typeof source.loadFullConversationForExport === "function") {
+          const api = await source.loadFullConversationForExport();
+          logEvent("CONVERSATION_API_RESPONSE_REPORT", api.apiDiagnostic || {});
+          logEvent("CONVERSATION_API_REPORT", {
+            status: api.success ? "SUCCESS" : "FAILED",
+            source: "API",
+            rawMessages: api.apiDiagnostic?.rawMessages || 0,
+            rawMappingNodes: api.apiDiagnostic?.rawMappingNodes || 0,
+            messages: api.messages || 0,
+            records: api.records?.length || 0,
+            pages: api.pagesLoaded || 0,
+            schema: api.apiDiagnostic?.schema || "unknown",
+            errors: api.errors || [],
+            normalization: api.normalization || {}
+          });
+          if (api.success && api.records?.length) {
+            state.records.clear();
+            for (const record of api.records) state.records.set(record.messageId, record);
+            state.apiSource = true;
+            // The page title can include a project prefix omitted by API title.
+            // Use the same full title for the Markdown heading and filename.
+            state.pageTitle = normalizeText(document.title) || normalizeText(api.title) || state.pageTitle;
+            apiExportLoaded = true;
+            logEvent("EXPORT_SOURCE_REPORT", { source: "API" });
+          }
+        }
+      } catch (error) {
+        logEvent("CONVERSATION_API_REPORT", { status: "FAILED", source: "API", error: error?.message || String(error) });
+      }
+      if (!apiExportLoaded && !shouldUseDomBackup()) {
+        throw new Error("API export unavailable and DOM backup disabled");
+      }
+
       installVisibilityGuard();
       await waitForVisible();
       startTimer();
       renderOverlay("Подготавливаю экспорт…");
       await saveCheckpoint({ force: true });
+      if (apiExportLoaded) {
+        if (state.cancelRequested) throw new Error("Экспорт остановлен");
+        const records = [...state.records.values()];
+        // API sequence is already selected and checked; DOM evidence is unrelated.
+        const validation = {
+          complete: true, issues: [], chain: { ids: records.map(r => r.messageId) },
+          chainRecords: records,
+          roleCounts: { user: records.filter(r => r.role === "user").length,
+            assistant: records.filter(r => r.role === "assistant").length },
+          aux: { processingCaptured: 0, processingFound: 0, artifacts: 0 },
+          skeleton: { skeleton: [] }
+        };
+        state.lastValidation = validation;
+        await finishComplete(validation);
+        return;
+      }
+
       const container = findScrollContainer();
       const initialMetrics = scrollMetrics(container);
       logEvent("SCROLL_ROOT", { clientHeight: initialMetrics.client, scrollHeight: initialMetrics.height, initialTop: Math.round(initialMetrics.top) });
