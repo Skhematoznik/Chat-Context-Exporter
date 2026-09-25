@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = "1.0.39";
+  const VERSION = "1.0.40";
   if (globalThis.__ChatGPTConversationExporter?.version === VERSION) return;
 
   const MESSAGE_SELECTOR = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
@@ -104,6 +104,9 @@ const CONFIG = Object.freeze({
     recordsAtCheckpoint: 0,
     currentPhase: "IDLE",
     currentStatus: "",
+    apiMode: false,
+    apiProgress: null,
+    apiAbortController: null,
     currentScan: 0,
     bottomSeekAttempt: 0,
     reachedBottom: false,
@@ -2079,6 +2082,17 @@ const CONFIG = Object.freeze({
   function renderOverlay(statusOverride = "") {
     const overlay = ensureOverlay();
     if (statusOverride) state.currentStatus = statusOverride;
+    if (state.apiMode) {
+      renderApiProgress(overlay);
+      return;
+    }
+    overlay.bar.classList.remove("indeterminate");
+    if (overlay.totalLabelEl) overlay.totalLabelEl.textContent = "Всего запросов";
+    if (overlay.savedLabelEl) overlay.savedLabelEl.textContent = "Пройдено запросов";
+    if (overlay.remainingLabelEl) overlay.remainingLabelEl.textContent = "Осталось запросов";
+    if (overlay.messagesLabelEl) overlay.messagesLabelEl.textContent = "Собрано сообщений";
+    if (overlay.structureLabelEl) overlay.structureLabelEl.textContent = "Структура turn-slot";
+    if (overlay.percentLabelEl) overlay.percentLabelEl.textContent = "Прогресс сканирования";
     const p = progressStats();
     const pct = p.percent == null ? null : p.percent;
     overlay.timeEl.textContent = formatDuration(elapsedMs());
@@ -2097,9 +2111,53 @@ const CONFIG = Object.freeze({
     overlay.statusEl.textContent = state.currentStatus || defaultStatusText(p);
   }
 
+  function updateApiProgress(progress) {
+    state.apiMode = true;
+    state.apiProgress = { ...(state.apiProgress || {}), ...progress };
+    const stage = state.apiProgress.stage || "CONNECTING";
+    logEvent("API_PROGRESS", { stage, pagesLoaded: state.apiProgress.pagesLoaded ?? 0,
+      rawMessages: state.apiProgress.rawMessages ?? 0, records: state.apiProgress.records ?? 0,
+      status: state.apiProgress.status || "" });
+    state.currentPhase = `API_${stage}`;
+    state.currentStatus = state.apiProgress.status || "Обрабатываю историю…";
+    renderOverlay();
+  }
+
+  function renderApiProgress(overlay) {
+    const p = state.apiProgress || {};
+    overlay.timeEl.textContent = formatDuration(elapsedMs());
+    overlay.phaseEl.textContent = phaseLabel(state.currentPhase);
+    if (overlay.totalLabelEl) overlay.totalLabelEl.textContent = "Получено страниц";
+    if (overlay.savedLabelEl) overlay.savedLabelEl.textContent = "Получено записей";
+    if (overlay.remainingLabelEl) overlay.remainingLabelEl.textContent = "Страницы истории";
+    if (overlay.messagesLabelEl) overlay.messagesLabelEl.textContent = "Включено в экспорт";
+    if (overlay.structureLabelEl) overlay.structureLabelEl.textContent = "Исключено / пусто";
+    if (overlay.percentLabelEl) overlay.percentLabelEl.textContent = "Этап";
+    overlay.totalEl.textContent = String(p.pagesLoaded ?? 0);
+    overlay.savedEl.textContent = String(p.rawMessages ?? 0);
+    overlay.remainingEl.textContent = p.hasPreviousPage === true ? "загрузка" : p.hasPreviousPage === false ? "все получены" : "ожидание ответа";
+    if (overlay.messagesEl) overlay.messagesEl.textContent = String(p.records ?? 0);
+    if (overlay.structureEl) overlay.structureEl.textContent = `${p.filtered ?? 0} / ${p.emptyContent ?? 0}`;
+    overlay.percentEl.textContent = p.stage === "NORMALIZED" || p.stage === "SERIALIZING" || p.stage === "SAVING" || p.stage === "COMPLETE" ? "готово" : "выполняется";
+    const busy = ["CONNECTING", "FETCHING", "NORMALIZING", "SERIALIZING", "SAVING"].includes(p.stage);
+    overlay.bar.classList.remove("hidden");
+    overlay.bar.classList.toggle("indeterminate", busy);
+    overlay.barFill.style.width = busy ? "34%" : (["NORMALIZED", "COMPLETE"].includes(p.stage) ? "100%" : "0%");
+    overlay.statusEl.textContent = state.currentStatus || "Обрабатываю историю…";
+  }
+
   function phaseLabel(phase) {
     const labels = {
       INITIALIZING: "Подготовка",
+      API_CONNECTING: "Подключение к истории чата",
+      API_FETCHING: "Загрузка истории через API",
+      API_NORMALIZING: "Обработка сообщений",
+      API_NORMALIZED: "Подготовка файла",
+      API_SERIALIZING: "Формирование Markdown",
+      API_SAVING: "Сохранение файла",
+      API_COMPLETE: "Готово",
+      API_ERROR: "Ошибка API",
+      API_CANCELLED: "Остановлено",
       PAUSED_HIDDEN: "Пауза: вкладка неактивна",
       SEEKING_BOTTOM: "Определение конца разговора",
       SEEKING_TOP: "Быстрый поиск начала разговора",
@@ -2153,19 +2211,19 @@ const CONFIG = Object.freeze({
     shadow.innerHTML = `
       <style>
         .box{pointer-events:auto;font-family:Arial,sans-serif;width:min(338px,calc(100vw - 36px));box-sizing:border-box;background:#202020;color:#d8d8d8;border:1px solid #555;border-radius:10px;padding:13px 14px 12px;box-shadow:0 8px 24px rgba(0,0,0,.34)}
-        .title{font-size:14px;font-weight:700;color:#e7e7e7;margin-bottom:10px}.phase{font-size:13px;color:#d0d0d0;margin-bottom:9px}.grid{display:grid;grid-template-columns:1fr auto;gap:5px 12px;font-size:12px;line-height:1.35}.k{color:#9d9d9d}.v{color:#dfdfdf;text-align:right;font-variant-numeric:tabular-nums}.bar{height:7px;background:#353535;border:1px solid #4c4c4c;border-radius:5px;overflow:hidden;margin:10px 0 8px}.fill{height:100%;width:0;background:#8b8b8b;transition:width .2s linear}.status{font-size:12px;line-height:1.4;color:#bcbcbc;min-height:17px}.actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:11px}.btn{appearance:none;border:1px solid #5d5d5d;background:#2d2d2d;color:#dcdcdc;border-radius:7px;padding:6px 9px;font-size:12px;cursor:pointer}.btn:hover{background:#383838}.primary{background:#d0d0d0;color:#1f1f1f;border-color:#d0d0d0}.primary:hover{background:#e0e0e0}.hidden{display:none!important}
+        .title{font-size:14px;font-weight:700;color:#e7e7e7;margin-bottom:10px}.phase{font-size:13px;color:#d0d0d0;margin-bottom:9px}.grid{display:grid;grid-template-columns:1fr auto;gap:5px 12px;font-size:12px;line-height:1.35}.k{color:#9d9d9d}.v{color:#dfdfdf;text-align:right;font-variant-numeric:tabular-nums}.bar.indeterminate .fill{width:34%!important;animation:api-sweep 1.2s ease-in-out infinite alternate}@keyframes api-sweep{from{transform:translateX(0)}to{transform:translateX(190%)}}.bar{height:7px;background:#353535;border:1px solid #4c4c4c;border-radius:5px;overflow:hidden;margin:10px 0 8px}.fill{height:100%;width:0;background:#8b8b8b;transition:width .2s linear}.status{font-size:12px;line-height:1.4;color:#bcbcbc;min-height:17px}.actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:11px}.btn{appearance:none;border:1px solid #5d5d5d;background:#2d2d2d;color:#dcdcdc;border-radius:7px;padding:6px 9px;font-size:12px;cursor:pointer}.btn:hover{background:#383838}.primary{background:#d0d0d0;color:#1f1f1f;border-color:#d0d0d0}.primary:hover{background:#e0e0e0}.hidden{display:none!important}
       </style>
       <div class="box">
         <div class="title">Экспортер контекста</div>
         <div class="phase"></div>
         <div class="grid">
           <div class="k">Время</div><div class="v time">00:00</div>
-          <div class="k">Всего запросов</div><div class="v total">—</div>
-          <div class="k">Пройдено запросов</div><div class="v saved">0</div>
-          <div class="k">Осталось запросов</div><div class="v remaining">—</div>
-          <div class="k">Собрано сообщений</div><div class="v messages">0</div>
-          <div class="k">Структура turn-slot</div><div class="v structure">—</div>
-          <div class="k">Прогресс сканирования</div><div class="v percent">—</div>
+          <div class="k total-label">Всего запросов</div><div class="v total">—</div>
+          <div class="k saved-label">Пройдено запросов</div><div class="v saved">0</div>
+          <div class="k remaining-label">Осталось запросов</div><div class="v remaining">—</div>
+          <div class="k messages-label">Собрано сообщений</div><div class="v messages">0</div>
+          <div class="k structure-label">Структура turn-slot</div><div class="v structure">—</div>
+          <div class="k percent-label">Прогресс сканирования</div><div class="v percent">—</div>
         </div>
         <div class="bar"><div class="fill"></div></div>
         <div class="status"></div>
@@ -2182,6 +2240,12 @@ const CONFIG = Object.freeze({
       phaseEl: shadow.querySelector(".phase"),
       timeEl: shadow.querySelector(".time"),
       totalEl: shadow.querySelector(".total"),
+      totalLabelEl: shadow.querySelector(".total-label"),
+      savedLabelEl: shadow.querySelector(".saved-label"),
+      remainingLabelEl: shadow.querySelector(".remaining-label"),
+      messagesLabelEl: shadow.querySelector(".messages-label"),
+      structureLabelEl: shadow.querySelector(".structure-label"),
+      percentLabelEl: shadow.querySelector(".percent-label"),
       savedEl: shadow.querySelector(".saved"),
       remainingEl: shadow.querySelector(".remaining"),
       messagesEl: shadow.querySelector(".messages"),
@@ -2199,6 +2263,8 @@ const CONFIG = Object.freeze({
 
     overlay.cancel.addEventListener("click", async () => {
       state.cancelRequested = true;
+      state.apiAbortController?.abort();
+      if (state.apiMode) updateApiProgress({ stage: "CANCELLED", status: "Останавливаю запрос и сохраняю состояние…" });
       state.currentPhase = "INTERRUPTED";
       renderOverlay("Сохраняю checkpoint и останавливаю…");
       await saveCheckpoint({ force: true, status: "INTERRUPTED" });
@@ -2207,14 +2273,17 @@ const CONFIG = Object.freeze({
     overlay.save.addEventListener("click", async () => {
       if (!state.pendingMarkdown || !state.pendingFilename) return;
       overlay.save.disabled = true;
-      renderOverlay("Открываю выбор места сохранения…");
+      if (state.apiMode) updateApiProgress({ stage: "SAVING", status: "Открываю выбор места сохранения…" });
+      else renderOverlay("Открываю выбор места сохранения…");
       try {
         await downloadText(state.pendingFilename, state.pendingMarkdown, "text/markdown", true);
-        renderOverlay("Файл сохранен.");
+        if (state.apiMode) updateApiProgress({ stage: "COMPLETE", status: "Файл Markdown сохранен." });
+        else renderOverlay("Файл сохранен.");
         setTimeout(removeOverlay, CONFIG.overlayAutoCloseMs);
       } catch (error) {
         overlay.save.disabled = false;
-        renderOverlay(`Сохранение не выполнено: ${error?.message || error}`);
+        if (state.apiMode) updateApiProgress({ stage: "NORMALIZED", status: `Сохранение не выполнено: ${error?.message || error}. Можно повторить.` });
+        else renderOverlay(`Сохранение не выполнено: ${error?.message || error}`);
       }
     });
 
@@ -3378,7 +3447,9 @@ const CONFIG = Object.freeze({
 
     state.finishedElapsedMs = elapsedMs();
     stopTimer();
-    state.currentPhase = "COMPLETE";
+    state.currentPhase = state.apiMode ? "API_COMPLETE" : "COMPLETE";
+    if (state.apiMode) updateApiProgress({ stage: state.settings.autoSaveExport ? "SAVING" : "NORMALIZED",
+      status: state.settings.autoSaveExport ? "Markdown подготовлен. Сохраняю файл…" : "Markdown подготовлен. Нажмите «Сохранить», чтобы выбрать папку." });
     const filename = `${sanitizeFilename(state.pageTitle)}.md`;
     state.pendingMarkdown = markdown;
     state.pendingFilename = filename;
@@ -3392,18 +3463,21 @@ const CONFIG = Object.freeze({
         await downloadText(filename, markdown, "text/markdown", false);
         logEvent("EXPORT_SAVED", { filename, saveAs: false });
         await maybeSaveLogSafe();
-        renderOverlay("Готово. Файл сохранен.");
+        if (state.apiMode) updateApiProgress({ stage: "COMPLETE", status: "Готово. Файл Markdown сохранен." });
+        else renderOverlay("Готово. Файл сохранен.");
         setTimeout(removeOverlay, CONFIG.overlayAutoCloseMs);
       } catch (error) {
         logEvent("EXPORT_SAVE_ERROR", { error: error?.message || error });
         await maybeSaveLogSafe();
         setActionButtons({ save: true, log: true });
-        renderOverlay("Экспорт подготовлен, но автоматическое сохранение не удалось. Нажмите «Сохранить».");
+        if (state.apiMode) updateApiProgress({ stage: "NORMALIZED", status: `Файл подготовлен, но автосохранение не удалось: ${error?.message || error}. Нажмите «Сохранить».` });
+        else renderOverlay("Экспорт подготовлен, но автоматическое сохранение не удалось. Нажмите «Сохранить».");
       }
     } else {
       await maybeSaveLogSafe();
       setActionButtons({ save: true });
-      renderOverlay("Проверка пройдена. Нажмите «Сохранить» и выберите место для файла.");
+      if (state.apiMode) updateApiProgress({ stage: "NORMALIZED", status: "Файл подготовлен. Нажмите «Сохранить», чтобы выбрать место." });
+      else renderOverlay("Проверка пройдена. Нажмите «Сохранить» и выберите место для файла.");
     }
   }
 
@@ -3433,6 +3507,9 @@ const CONFIG = Object.freeze({
 
   async function resetRunState({ fresh = false } = {}) {
     state.cancelRequested = false;
+    state.apiMode = false;
+    state.apiProgress = null;
+    state.apiAbortController = null;
     state.records.clear();
     state.apiSource = false;
     state.observations.clear();
@@ -3519,12 +3596,23 @@ const CONFIG = Object.freeze({
     try {
       await resetRunState({ fresh });
 
-      // 1.0.39 API export pipeline.
+      // API retrieval can take time even before the first response arrives.
+      state.apiMode = true;
+      state.apiAbortController = new AbortController();
+      state.startedAt = Date.now();
+      startTimer();
+      updateApiProgress({ stage: "CONNECTING", pagesLoaded: 0, rawMessages: 0, records: 0,
+        filtered: 0, emptyContent: 0, hasPreviousPage: null, status: "Подключаюсь к источнику истории…" });
+
+      // 1.0.40 API export pipeline.
       let apiExportLoaded = false;
       try {
         const source = globalThis.__ChatContextConversationSource;
         if (source && typeof source.loadFullConversationForExport === "function") {
-          const api = await source.loadFullConversationForExport();
+          const api = await source.loadFullConversationForExport({
+            signal: state.apiAbortController.signal,
+            onProgress: updateApiProgress
+          });
           logEvent("CONVERSATION_API_RESPONSE_REPORT", api.apiDiagnostic || {});
           logEvent("CONVERSATION_API_REPORT", {
             status: api.success ? "SUCCESS" : "FAILED",
@@ -3550,16 +3638,34 @@ const CONFIG = Object.freeze({
           }
         }
       } catch (error) {
-        logEvent("CONVERSATION_API_REPORT", { status: "FAILED", source: "API", error: error?.message || String(error) });
+        if (state.cancelRequested || state.apiAbortController?.signal.aborted) {
+          state.currentPhase = "INTERRUPTED";
+          updateApiProgress({ stage: "CANCELLED", status: "Загрузка API остановлена." });
+        } else {
+          logEvent("CONVERSATION_API_REPORT", { status: "FAILED", source: "API", error: error?.message || String(error) });
+          updateApiProgress({ stage: "ERROR", status: `Не удалось загрузить историю через API: ${error?.message || String(error)}` });
+        }
+      }
+      if (state.cancelRequested) {
+        logEvent("RESULT", { status: "INTERRUPTED", source: "API" });
+        await maybeSaveLogSafe();
+        setActionButtons({ log: true });
+        renderOverlay("Загрузка API остановлена.");
+        return;
       }
       if (!apiExportLoaded && !shouldUseDomBackup()) {
+        if (state.apiMode && state.currentPhase !== "API_ERROR") {
+          updateApiProgress({ stage: "ERROR", status: "API не вернул пригодную историю. Экспорт остановлен; резервный DOM-разбор отключен." });
+        }
         throw new Error("API export unavailable and DOM backup disabled");
       }
 
+      if (!apiExportLoaded) state.apiMode = false;
       installVisibilityGuard();
       await waitForVisible();
       startTimer();
-      renderOverlay("Подготавливаю экспорт…");
+      if (apiExportLoaded) updateApiProgress({ stage: "SERIALIZING", status: "Формирую Markdown из проверенной последовательности…" });
+      else renderOverlay("Подготавливаю экспорт…");
       await saveCheckpoint({ force: true });
       if (apiExportLoaded) {
         if (state.cancelRequested) throw new Error("Экспорт остановлен");
@@ -3787,6 +3893,8 @@ const CONFIG = Object.freeze({
     start,
     getState: () => ({
       running: state.running,
+      source: state.apiMode ? "API" : "DOM",
+      apiProgress: state.apiProgress ? { ...state.apiProgress } : null,
       phase: state.currentPhase,
       records: state.records.size,
       stableRecords: stableRecordCount(),

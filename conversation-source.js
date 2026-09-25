@@ -1,12 +1,12 @@
 (() => {
-  const API_SOURCE_VERSION = "1.0.39";
+  const API_SOURCE_VERSION = "1.0.40";
 
   function getConversationId() {
     const match = location.pathname.match(/\/c\/([a-zA-Z0-9-]+)/);
     return match ? match[1] : null;
   }
 
-  async function getAuthorizationToken() {
+  async function getAuthorizationToken(signal) {
     const report = {
       tokenAvailable: false,
       method: "",
@@ -17,6 +17,7 @@
       async () => {
         const response = await fetch("/api/auth/session", {
           credentials: "include",
+          signal,
           headers: { "accept": "application/json" }
         });
         if (!response.ok) throw new Error(`session-http-${response.status}`);
@@ -80,9 +81,10 @@
     return ordered.reverse();
   }
 
-  async function tryRequest(url, token) {
+  async function tryRequest(url, token, signal) {
     const response = await fetch(url, {
       credentials: "include",
+      signal,
       headers: {
         "accept": "application/json",
         ...(token ? { "Authorization": `Bearer ${token}` } : {})
@@ -104,8 +106,8 @@
   }
 
 
-  async function requestConversationPage(url, token) {
-    const result = await tryRequest(url, token);
+  async function requestConversationPage(url, token, signal) {
+    const result = await tryRequest(url, token, signal);
     return {
       ...result,
       messages: Array.isArray(result.data?.messages) ? result.data.messages : [],
@@ -125,7 +127,7 @@
     return [...map.values()];
   }
 
-  async function loadConversationPages(conversationId, token, firstResult) {
+  async function loadConversationPages(conversationId, token, firstResult, onProgress, signal) {
     const pages = [];
     const visited = new Set();
 
@@ -135,6 +137,8 @@
     };
 
     pages.push(current);
+    onProgress?.({ stage: "FETCHING", pagesLoaded: 1, rawMessages: current.messages.length,
+      hasPreviousPage: Boolean(current.pageInfo?.has_previous_page), status: "Получена первая страница истории." });
 
     while (current.pageInfo?.has_previous_page) {
       const cursor = current.pageInfo.start_cursor;
@@ -144,9 +148,11 @@
 
       visited.add(cursor);
 
+      onProgress?.({ stage: "FETCHING", pagesLoaded: pages.length, rawMessages: pages.reduce((n, page) => n + page.messages.length, 0),
+        hasPreviousPage: true, status: `Загружаю следующую страницу истории (${pages.length + 1}).` });
       const next = await requestConversationPage(
         `/backend-api/conversations/${conversationId}/messages?before=${encodeURIComponent(cursor)}&include_has_versions=true&num_turns=100`,
-        token
+        token, signal
       );
 
       if (!next.response.ok) {
@@ -162,12 +168,15 @@
       };
 
       pages.push(current);
+      onProgress?.({ stage: "FETCHING", pagesLoaded: pages.length, rawMessages: pages.reduce((n, page) => n + page.messages.length, 0),
+        hasPreviousPage: Boolean(current.pageInfo.has_previous_page), status: current.pageInfo.has_previous_page
+          ? `Получено страниц: ${pages.length}. Продолжаю загрузку истории.` : `Получено страниц: ${pages.length}. История загружена.` });
     }
 
-    return {
-      pages,
-      messages: mergeMessages(pages)
-    };
+    const messages = mergeMessages(pages);
+    onProgress?.({ stage: "NORMALIZING", pagesLoaded: pages.length, rawMessages: messages.length,
+      hasPreviousPage: false, status: `История загружена: ${pages.length} страниц, ${messages.length} записей. Обрабатываю сообщения.` });
+    return { pages, messages };
   }
 
 
@@ -194,7 +203,7 @@
     };
   }
 
-  async function loadConversationSource() {
+  async function loadConversationSource({ onProgress = () => {}, signal } = {}) {
     const conversationId = getConversationId();
 
     const baseReport = {
@@ -215,7 +224,9 @@
       return { ...baseReport, error: "conversation-id-not-found" };
     }
 
-    const auth = await getAuthorizationToken();
+    onProgress({ stage: "CONNECTING", status: "Подключаюсь к источнику истории…" });
+    const auth = await getAuthorizationToken(signal);
+    if (signal?.aborted) throw new Error("Экспорт отменен пользователем");
     baseReport.tokenAvailable = auth.report.tokenAvailable;
 
     const urls = [
@@ -227,7 +238,10 @@
 
     for (const url of urls) {
       try {
-        const result = await tryRequest(url, auth.token);
+        onProgress({ stage: "FETCHING", pagesLoaded: 0, rawMessages: 0, hasPreviousPage: null,
+          status: "Запрашиваю историю чата у сервера…" });
+        const result = await tryRequest(url, auth.token, signal);
+        if (signal?.aborted) throw new Error("Экспорт отменен пользователем");
 
         baseReport.httpStatus = result.response.status;
         baseReport.endpoint = url;
@@ -246,7 +260,7 @@
           throw new Error("history-boundaries-unconfirmed");
         }
         const loaded = isMapping ? { pages: [data], messages: [] } :
-          await loadConversationPages(conversationId, auth.token, result);
+          await loadConversationPages(conversationId, auth.token, result, onProgress, signal);
         const nodes = isMapping ? Object.entries(data.mapping).map(([id, node]) => normalizeMessage(node, id)) :
           loaded.messages.map(m => normalizeMessage(m));
         // Flat API messages are already the selected, ordered history. Metadata
@@ -257,7 +271,13 @@
         if (!isMapping && data.current_node && sequence.at(-1)?.id !== data.current_node) {
           throw new Error("history-end-node-mismatch");
         }
-        const records = normalizeExportRecords(sequence);
+        onProgress({ stage: "NORMALIZING", pagesLoaded: loaded.pages.length, rawMessages: sequence.length,
+          hasPreviousPage: false, status: `Нормализую историю: ${sequence.length} записей…` });
+        const records = await normalizeExportRecords(sequence, onProgress, loaded.pages.length, signal);
+        const normalization = { ...globalThis.__ChatContextNormalizationReport };
+        onProgress({ stage: "NORMALIZED", pagesLoaded: loaded.pages.length, rawMessages: sequence.length,
+          records: records.length, filtered: normalization.filtered, emptyContent: normalization.emptyContent,
+          hasPreviousPage: false, status: `Обработка завершена: ${sequence.length} записей, ${records.length} сообщений войдут в файл.` });
         if (!records.length) throw new Error("no-exportable-messages");
 
         return {
@@ -271,10 +291,11 @@
           messagesData: loaded.messages,
           records,
           sequenceIds: sequence.map(n => n.id),
-          normalization: { ...globalThis.__ChatContextNormalizationReport },
+          normalization,
           apiDiagnostic: buildApiResponseDiagnostic(result)
         };
       } catch (error) {
+        if (signal?.aborted || error?.name === "AbortError" || error?.message === "Экспорт отменен пользователем") throw error;
         errors.push(`${url}:${error?.message || "fetch-error"}`);
       }
     }
@@ -333,7 +354,7 @@
     return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} (${zone})`;
   }
 
-  function normalizeExportRecords(source) {
+  async function normalizeExportRecords(source, onProgress = () => {}, pagesLoaded = 0, signal) {
     const stats = {
       inputMessages: source.length,
       acceptedUser: 0,
@@ -346,7 +367,10 @@
 
     globalThis.__ChatContextNormalizationReport = stats;
 
-    const records = source.map((node, index) => {
+    const records = [];
+    for (let index = 0; index < source.length; index++) {
+      if (signal?.aborted) throw new Error("Экспорт отменен пользователем");
+      const node = source[index];
       const m = node.message;
       const role = m?.author?.role || m?.role || "";
       const channel = m?.channel || "";
@@ -354,12 +378,14 @@
 
       if (hidden || !["user", "assistant"].includes(role)) {
         stats.filtered++;
-        return null;
+        records.push(null);
+        continue;
       }
 
       if (role === "assistant" && ((channel && channel !== "final") || (m?.recipient && m.recipient !== "all"))) {
         stats.filtered++;
-        return null;
+        records.push(null);
+        continue;
       }
 
       const parts = Array.isArray(m?.content?.parts) ? m.content.parts : [];
@@ -373,13 +399,14 @@
 
       if (!markdown) {
         stats.emptyContent++;
-        return null;
+        records.push(null);
+        continue;
       }
 
       if (role === "user") stats.acceptedUser++;
       if (role === "assistant") stats.acceptedAssistantFinal++;
 
-      return {
+      records.push({
         messageId: m?.id || node.id,
         role,
         turnId: m?.metadata?.turn_id || "",
@@ -392,15 +419,22 @@
         parentId: node.parent,
         dateLabel: "",
         signature: `api:${m?.id || index}`
-      };
-    }).filter(Boolean);
+      });
+      if ((index + 1) % 100 === 0 || index === source.length - 1) {
+        onProgress({ stage: "NORMALIZING", pagesLoaded, rawMessages: source.length,
+          records: stats.acceptedUser + stats.acceptedAssistantFinal, filtered: stats.filtered, emptyContent: stats.emptyContent,
+          hasPreviousPage: false, status: `Обработано записей: ${index + 1} из ${source.length}. В экспорт включено ${stats.acceptedUser + stats.acceptedAssistantFinal}.` });
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
 
-    stats.records = records.length;
-    return records;
+    const exportRecords = records.filter(Boolean);
+    stats.records = exportRecords.length;
+    return exportRecords;
   }
 
-  async function loadFullConversationForExport() {
-    const report = await loadConversationSource();
+  async function loadFullConversationForExport(options = {}) {
+    const report = await loadConversationSource(options);
     report.extractedMessages = report.messagesData?.length || 0;
     return {
       ...report,
