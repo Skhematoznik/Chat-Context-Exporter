@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat Context Exporter — настройки</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <img src="../../assets/icons/icon128.png" width="72" height="72" alt="">
+      <div>
+        <h1>Chat Context Exporter</h1>
+        <p>Настройки локального сбора контекста AI-диалогов.</p>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>Сохранение</h2>
+
+      <label class="toggle-row">
+        <span>
+          <strong>Автосохранение</strong>
+          <small>После завершения цикла автоматически сохранять итоговый файл в каталог загрузок, настроенный в браузере. Обычно это папка Downloads (в Windows часто C:\Users\&lt;пользователь&gt;\Downloads), если путь не был изменен пользователем. Если выключено, после сбора появятся кнопки «Сохранить» и «Отмена».</small>
+        </span>
+        <input id="autoSave" type="checkbox">
+      </label>
+
+      <label class="toggle-row">
+        <span>
+          <strong>Закрывать панель после сохранения</strong>
+          <small>После успешного сохранения итогового файла автоматически закрывать панель расширения. Включено по умолчанию.</small>
+        </span>
+        <input id="autoClosePanel" type="checkbox">
+      </label>
+
+      <label class="toggle-row">
+        <span>
+          <strong>Сохранять лог</strong>
+          <small>Создавать отдельный TXT-журнал работы и автоматически сохранять его в каталог загрузок, настроенный в браузере. Диалог выбора места для лога не показывается.</small>
+        </span>
+        <input id="saveLog" type="checkbox">
+      </label>
+    </section>
+
+    <section class="card">
+      <h2>Надежность сбора</h2>
+
+      <label class="toggle-row">
+        <span>
+          <strong>Дополнительные проходы</strong>
+          <small>После основного прохода повторно пройти весь чат от конца к началу и обратно, продолжая добирать и сопоставлять сообщения. Помогает снизить риск пропуска элементов при временной задержке рендера или виртуализации. Выключено по умолчанию.</small>
+        </span>
+        <input id="extraPassesEnabled" type="checkbox">
+      </label>
+
+      <div class="single-field" id="extraPassCountRow">
+        <label>
+          <span>Количество дополнительных проходов</span>
+          <input id="extraPassCount" type="number" min="1" max="3" step="1">
+          <small>От 1 до 3 дополнительных проходов. При значении 3 расширение выполнит 4 полных прохода: один основной и три проверочных.</small>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Прокрутка</h2>
+      <p class="hint">Случайная задержка между последовательными шагами прокрутки.</p>
+
+      <div class="grid">
+        <label>
+          <span>Минимальная задержка, мс</span>
+          <input id="minDelayMs" type="number" min="100" max="60000" step="100">
+        </label>
+
+        <label>
+          <span>Максимальная задержка, мс</span>
+          <input id="maxDelayMs" type="number" min="100" max="60000" step="100">
+        </label>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="reset" class="primary" type="button">По умолчанию</button>
+      <span id="message" role="status">Изменения применяются автоматически.</span>
+    </div>
+  </main>
+
+  <script src="options.js"></script>
+</body>
+</html>

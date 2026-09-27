@@ -1,34 +1,33 @@
 {
   "manifest_version": 3,
   "name": "Chat Context Exporter",
-  "version": "1.0.40",
-  "description": "Экспортирует ChatGPT в Markdown: строгая полнота, безопасная сериализация noncanonical turn-slot, работа без TOC и диагностический лог.",
+  "version": "0.1.9",
+  "description": "Локальный экспорт контекста AI-диалогов из содержимого текущей страницы.",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Chat Context Exporter — запустить",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background/service-worker.js"
+  },
+  "options_ui": {
+    "page": "src/options/options.html",
+    "open_in_tab": true
+  },
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
-    "unlimitedStorage",
-    "downloads",
-    "contextMenus"
+    "downloads"
   ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "action": {
-    "default_title": "Экспортировать контекст чата",
-    "default_icon": {
-      "16": "icons/icon16.png",
-      "32": "icons/icon32.png"
-    }
-  },
-  "icons": {
-    "16": "icons/icon16.png",
-    "32": "icons/icon32.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
-  },
-  "options_ui": {
-    "page": "options.html",
-    "open_in_tab": true
-  }
+  "version_name": "0.1.9 — Grok baseline"
 }

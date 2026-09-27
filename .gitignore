@@ -1,16 +1,22 @@
-# OS / editors
+# OS
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# Editors / IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Local diagnostics and exported chats
-Chat Context Exporter - *.txt
-НЕПОЛНЫЙ - *.md
-
-# Release/build scratch
+# Local artifacts
 *.zip
 *.crx
 *.pem
-release/
-dist/
+*.log
+
+# Temporary files
+.tmp/
+tmp/
+temp/
