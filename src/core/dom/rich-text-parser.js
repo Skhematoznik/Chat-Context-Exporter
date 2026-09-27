@@ -27,6 +27,23 @@
     return /\S/.test(normalizeText(value));
   }
 
+  function isExplicitlyHidden(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    if (element.hasAttribute('hidden') || element.getAttribute('aria-hidden') === 'true') {
+      return true;
+    }
+
+    const style = String(element.getAttribute('style') || '');
+    return (
+      /(?:^|;)\s*display\s*:\s*none\s*(?:!important)?\s*(?:;|$)/i.test(style)
+      || /(?:^|;)\s*visibility\s*:\s*(?:hidden|collapse)\s*(?:!important)?\s*(?:;|$)/i.test(style)
+      || /(?:^|;)\s*opacity\s*:\s*0(?:\.0+)?\s*(?:!important)?\s*(?:;|$)/i.test(style)
+    );
+  }
+
   function parseLanguageFromCodeBlock(element, codeElement) {
     const candidates = [
       codeElement?.getAttribute?.('data-language'),
@@ -97,7 +114,7 @@
       return [];
     }
 
-    if (node.getAttribute('aria-hidden') === 'true') {
+    if (isExplicitlyHidden(node)) {
       return [];
     }
 
@@ -230,7 +247,7 @@
       return [];
     }
 
-    if (node.getAttribute('aria-hidden') === 'true') {
+    if (isExplicitlyHidden(node)) {
       return [];
     }
 
@@ -309,7 +326,7 @@
         continue;
       }
 
-      if (child.getAttribute('aria-hidden') === 'true') {
+      if (isExplicitlyHidden(child)) {
         continue;
       }
 

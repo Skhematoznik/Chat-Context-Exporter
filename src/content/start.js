@@ -396,6 +396,7 @@
     let stableTopChecks = 0;
     let semanticStableChecks = 0;
     let previousTopHeight = null;
+    let previousTopSignature = null;
     let scrollCommands = 0;
     let effectiveMoves = 0;
     let consecutiveStalledScrolls = 0;
@@ -466,6 +467,9 @@
         const heightUnchanged = previousTopHeight !== null && afterWait.height === previousTopHeight;
         const boundaryState = runtime.adapter.getHistoryStartState?.(scrollContainer) || null;
         const semanticReached = boundaryState ? Boolean(boundaryState.reached) : true;
+        const boundarySignature = boundaryState?.signature ?? null;
+        const signatureUnchanged = boundarySignature === null
+          || (previousTopSignature !== null && boundarySignature === previousTopSignature);
 
         log.write('TOP_CHECK', {
           ...passContext,
@@ -473,13 +477,14 @@
           scrollHeight: afterWait.height,
           topStillReached,
           heightUnchanged,
+          signatureUnchanged,
           semanticReached,
           stableTopChecks,
           messages: batch?.total ?? runtime.collector?.getStats?.().total ?? 0,
         });
         logBoundaryState('HISTORY_START_SIGNAL', boundaryState ? { ...passContext, ...boundaryState } : null);
 
-        if (topStillReached && heightUnchanged) {
+        if (topStillReached && heightUnchanged && signatureUnchanged) {
           stableTopChecks += 1;
           if (semanticReached) {
             semanticStableChecks += 1;
@@ -492,6 +497,7 @@
         }
 
         previousTopHeight = afterWait.height;
+        previousTopSignature = boundarySignature;
 
         if (topStillReached && stableTopChecks >= TOP_STABILITY_CHECKS && semanticReached) {
           const phaseDurationMs = Date.now() - phaseStartedAt;
@@ -524,7 +530,7 @@
           && stableTopChecks >= SEMANTIC_BOUNDARY_MAX_STABLE_CHECKS
           && !semanticReached
         ) {
-          throw new Error('Grok: верхняя позиция стабильна, но DOM-признак начала истории не подтвержден.');
+          throw new Error(`${runtime.adapter?.displayName || 'Чат'}: верхняя позиция стабильна, но DOM-признак начала истории не подтвержден.`);
         }
 
         continue;
@@ -533,6 +539,7 @@
       stableTopChecks = 0;
       semanticStableChecks = 0;
       previousTopHeight = null;
+      previousTopSignature = null;
       runtime.panel.setStatus(formatPassStatus(
         passContext,
         'Едем к началу истории...',
@@ -613,6 +620,7 @@
     let stableBottomChecks = 0;
     let physicalBottomChecks = 0;
     let previousBottomHeight = null;
+    let previousBottomSignature = null;
     let scrollCommands = 0;
     let effectiveMoves = 0;
     let consecutiveStalledScrolls = 0;
@@ -688,6 +696,9 @@
         const heightUnchanged = previousBottomHeight !== null && afterWait.height === previousBottomHeight;
         const boundaryState = runtime.adapter.getHistoryEndState?.(scrollContainer) || null;
         const semanticReached = boundaryState ? Boolean(boundaryState.reached) : true;
+        const boundarySignature = boundaryState?.signature ?? null;
+        const signatureUnchanged = boundarySignature === null
+          || (previousBottomSignature !== null && boundarySignature === previousBottomSignature);
         const batch = collectForPhase('bottom-check');
 
         log.write('BOTTOM_CHECK', {
@@ -696,6 +707,7 @@
           scrollHeight: afterWait.height,
           bottomStillReached,
           heightUnchanged,
+          signatureUnchanged,
           semanticReached,
           stableBottomChecks,
           physicalBottomChecks,
@@ -703,7 +715,7 @@
         });
         logBoundaryState('HISTORY_END_SIGNAL', boundaryState ? { ...passContext, ...boundaryState } : null);
 
-        if (bottomStillReached && heightUnchanged) {
+        if (bottomStillReached && heightUnchanged && signatureUnchanged) {
           physicalBottomChecks += 1;
           if (semanticReached) {
             stableBottomChecks += 1;
@@ -716,6 +728,7 @@
         }
 
         previousBottomHeight = afterWait.height;
+        previousBottomSignature = boundarySignature;
 
         if (bottomStillReached && stableBottomChecks >= BOTTOM_STABILITY_CHECKS && semanticReached) {
           const phaseDurationMs = Date.now() - phaseStartedAt;
@@ -749,7 +762,7 @@
           && physicalBottomChecks >= SEMANTIC_BOUNDARY_MAX_STABLE_CHECKS
           && !semanticReached
         ) {
-          throw new Error('Grok: нижняя позиция стабильна, но DOM-признак конца истории не подтвержден.');
+          throw new Error(`${runtime.adapter?.displayName || 'Чат'}: нижняя позиция стабильна, но DOM-признак конца истории не подтвержден.`);
         }
 
         continue;
@@ -758,6 +771,7 @@
       stableBottomChecks = 0;
       physicalBottomChecks = 0;
       previousBottomHeight = null;
+      previousBottomSignature = null;
       runtime.panel.setStatus(formatPassStatus(
         passContext,
         'Добираю историю вниз...',
@@ -956,6 +970,11 @@
           userBefore: beforeStats.user,
           assistantBefore: beforeStats.assistant,
         });
+        const passStartState = runtime.adapter.getHistoryEndState?.(runtime.scrollContainer) || null;
+        logBoundaryState(
+          'PASS_START_VIEW',
+          passStartState ? { ...passContext, ...passStartState } : null,
+        );
 
         const seekResult = await seekHistoryStart(currentSettings, passContext);
         if (!seekResult || runtime.aborted) {
@@ -1023,7 +1042,7 @@
 
         const durationMs = Date.now() - runtime.startedAt;
         log.write('COMPLETED', {
-          reason: 'grok-markdown-export',
+          reason: `${runtime.adapter.id}-markdown-export`,
           messages: finalStats.total,
           user: finalStats.user,
           assistant: finalStats.assistant,
@@ -1076,7 +1095,7 @@
 
       const durationMs = Date.now() - runtime.startedAt;
       log.write('COMPLETED', {
-        reason: 'grok-markdown-export-manual',
+        reason: `${runtime.adapter.id}-markdown-export-manual`,
         messages: finalStats.total,
         user: finalStats.user,
         assistant: finalStats.assistant,
