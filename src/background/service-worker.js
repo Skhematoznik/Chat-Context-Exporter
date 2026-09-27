@@ -12,6 +12,7 @@ const CONTENT_SCRIPTS = [
   'src/adapters/generic-adapter.js',
   'src/adapters/grok-adapter.js',
   'src/adapters/deepseek-adapter.js',
+  'src/adapters/claude-adapter.js',
   'src/exporters/markdown-exporter.js',
   'src/ui/panel.js',
   'src/content/start.js',

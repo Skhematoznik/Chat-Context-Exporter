@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chat Context Exporter",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Локальный экспорт контекста AI-диалогов из содержимого текущей страницы.",
   "icons": {
     "16": "assets/icons/icon16.png",
@@ -29,5 +29,5 @@
     "storage",
     "downloads"
   ],
-  "version_name": "0.2.1"
+  "version_name": "0.3.0"
 }
