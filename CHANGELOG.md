@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.8.1 — 2026-09-28
+
+ChatGPT Shared переведен с диагностического capture 0.8.0 на production passive-network adapter с локальным decoding опубликованного snapshot.
+
+- `/share/...` теперь использует общий passive `chrome.debugger` Network transport и захватывает только штатный `GET` основного Document текущей shared-страницы;
+- после `Network.loadingFinished` background читает уже полученный браузером HTML через `Network.getResponseBody`; собственные API/backend-запросы, request interception и page-world execution отсутствуют;
+- добавлен `src/adapters/chatgpt/shared-wire-parser.js`: HTML не исполняется, parser локально извлекает JSON string из `window.__reactRouterContext.streamController.enqueue(...)`, декодирует React Router reference-table и получает `serverResponse.data.linear_conversation`;
+- большой HTML body разбирается в background и не пересылается целиком в content runtime; в capture state остается только компактный normalized snapshot;
+- подтверждены три fixtures одной схемы: AWF `225 raw -> 28 transcript`, Chat Context Exporter `2090 -> 108`, Tools MT5 Framework `4646 -> 200`;
+- validation требует уникальные raw node IDs, непрерывный parent-chain и совпадение `current_node` с последним raw node;
+- transcript включает только видимые `user` и видимые `assistant` с `channel=final` / `recipient=all`; system/tool/reasoning/commentary/hidden nodes исключаются;
+- поддержаны `text`, пользовательский `multimodal_text`, timestamps и metadata вложений; внутренние asset IDs не превращаются в выдуманные URL;
+- `grouped_webpages` citations восстанавливаются в обычные Markdown links; file citations сохраняются как переносимое текстовое имя источника/диапазон строк; bottom-list follow-up suggestions и hidden/invalid internal markers не экспортируются;
+- дополнительные проходы Shared снова используют общую network-семантику: повторный reload + passive Document capture, с pass statistics по стабильным message IDs;
+- отдельная диагностическая CDP-сессия 0.8.0, сохранение `ChatGPT-Shared-Passive-Capture_*.txt` и связанный dead code удалены;
+- Grok, Claude, DeepSeek и legacy ChatGPT `/c/...` функционально не изменены.
+
+## 0.8.0 — 2026-09-28
+
+Начата миграция ChatGPT Shared с DOM на passive network acquisition. Версия является диагностическим кандидатом: ее задача — определить фактический wire-format shared snapshot без page-world execution и без собственных backend-запросов.
+
+- `src/adapters/chatgpt/shared-profile.js` полностью перестроен: старый DOM/scrolling SharedProfile удален; `/share/...` теперь объявляет `acquisitionMode=passive-network-diagnostic`;
+- обычный ChatGPT `/c/...` thread-profile не менялся и остается legacy DOM adapter;
+- background добавляет отдельную диагностическую CDP-сессию: `Network.enable` + `Page.enable`, затем обычный `chrome.tabs.reload`;
+- слушаются `Network.requestWillBeSent`, `responseReceived`, `loadingFinished`, `loadingFailed`, а также main-frame `Page.frameNavigated` и `Page.loadEventFired`;
+- к body допускаются только responses `chatgpt.com` типов `Document` / `Fetch` / `XHR` / `Other` с text/JSON-like MIME; image/media/font/stylesheet и сторонние origins не читаются;
+- `Network.getResponseBody` вызывается только после `loadingFinished`; отдельный request никогда не повторяется расширением;
+- response body локально сканируется на `shareId`, `routes/share.$shareId.($action)`, `sharedConversationId`, `serverResponse`, `linear_conversation`, `conversation_id`, `current_node`;
+- для JSON body выполняется read-only structural probe, способный подтвердить `linear_conversation`, `current_node` и число raw nodes;
+- technical log не содержит полного response body, headers, cookies, Authorization или POST body; URL в диагностике очищается от query/hash;
+- при наличии кандидата сохраняется локальный `ChatGPT-Shared-Passive-Capture_*.txt` с metadata и полным body **одного** наиболее сильного response-кандидата;
+- extra passes для diagnostic Shared намеренно игнорируются: один пользовательский запуск = один reload/capture window;
+- README добавляет отдельное предупреждение о действующем ограничении OpenAI Terms of Use на automatic/programmatic extraction и рекомендует не применять расширение к authenticated/private ChatGPT pages без самостоятельной проверки допустимости;
+- Grok, Claude и DeepSeek 0.7.2 функционально не изменены.
+
+## 0.7.2 — 2026-09-28
+
+Зафиксирован единый passive/read-only acquisition policy и DeepSeek переведен с MAIN-world bridge на прямое readonly-чтение IndexedDB из ISOLATED content-script world.
+
+- удален `chrome.scripting.executeScript(..., world="MAIN")` reader DeepSeek и весь background message bridge для чтения IndexedDB;
+- DeepSeek после обязательного обычного reload читает `deepseek-chat / history-message` непосредственно из extension content script в `ISOLATED` world;
+- IndexedDB transaction остается строго `readonly`; `put`, `add`, `delete`, `clear`, `deleteDatabase` и иные записи в site storage не используются;
+- перед `open()` используется `indexedDB.databases()` когда API доступен; если база отсутствует, возможный `upgradeneeded` немедленно abort'ится, чтобы расширение не создавало site database;
+- все runtime scripts теперь явно запускаются с `world: "ISOLATED"`, а не полагаются на default Chrome behavior;
+- зафиксирован общий invariant для всех адаптеров: запрещены MAIN-world execution, `Runtime.evaluate`, `<script>` injection, вызовы внутренних page-функций, собственные `fetch`/XHR/WebSocket к сервису, изменение request/response, использование auth credentials для запросов и запись/удаление site storage;
+- разрешены только extension-код в `ISOLATED` world, read-only DOM/browser-storage access, passive `chrome.debugger` observation, обычный browser reload/scroll при необходимости адаптера и локальный parsing/export;
+- Grok/Claude acquisition не изменен: они по-прежнему пассивно читают штатные response body через CDP `Network`;
+- DeepSeek parser, reload/stability logic, citations и Markdown output функционально не менялись.
+
 ## 0.7.1 — 2026-09-28
 
 DeepSeek local-cache acquisition синхронизирован с фактическим поведением сайта после live-ответов.

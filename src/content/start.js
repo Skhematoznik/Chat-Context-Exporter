@@ -82,7 +82,6 @@
   const CAPTURE_CANCEL_MESSAGE = 'chat-context-exporter:capture:cancel';
   const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
   const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
-  const PAGE_INDEXEDDB_GET_MESSAGE = 'chat-context-exporter:indexeddb:get';
   const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
   const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
   const LOCAL_CACHE_SYNC_RELEASE_MESSAGE = 'chat-context-exporter:local-cache-sync:release';
@@ -319,7 +318,11 @@
     const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
     const blockCount = messages.reduce((sum, message) => sum + (Array.isArray(message.blocks) ? message.blocks.length : 0), 0);
     const emptyMessages = messages.reduce((sum, message) => sum + ((message.blocks?.length || 0) === 0 ? 1 : 0), 0);
-    const pageTitle = String(document.title || '').trim() || `Диалог с ${runtime.adapter?.displayName || 'ассистентом'}`;
+    const preferredTitle = runtime.adapter?.variant === 'shared-public'
+      ? conversation?.title
+      : null;
+    const pageTitle = String(preferredTitle || document.title || '').trim()
+      || `Диалог с ${runtime.adapter?.displayName || 'ассистентом'}`;
     const content = markdownExporter.exportConversation({
       title: pageTitle,
       startedAt: conversation?.startedAt || null,
@@ -1218,18 +1221,103 @@
     }
   }
 
-  async function sendIndexedDbGet(config) {
-    const response = await chrome.runtime.sendMessage({
-      type: PAGE_INDEXEDDB_GET_MESSAGE,
-      databaseName: config.databaseName,
-      storeName: config.storeName,
-      key: config.key,
+  async function readIndexedDbRecordReadonly(config) {
+    const databaseName = typeof config?.databaseName === 'string' ? config.databaseName.trim() : '';
+    const storeName = typeof config?.storeName === 'string' ? config.storeName.trim() : '';
+    const key = config?.key;
+
+    if (!databaseName || !storeName || key === undefined || key === null) {
+      throw new Error('Некорректные параметры read-only чтения IndexedDB.');
+    }
+
+    if (!globalThis.indexedDB) {
+      return { found: false, reason: 'indexeddb-unavailable', databaseVersion: null, record: null };
+    }
+
+    if (typeof indexedDB.databases === 'function') {
+      try {
+        const databases = await indexedDB.databases();
+        const existing = databases.find((item) => item?.name === databaseName);
+        if (!existing) {
+          return { found: false, reason: 'database-missing', databaseVersion: null, record: null };
+        }
+      } catch {
+        // Some Chromium builds may reject databases(); open() below still aborts
+        // on upgradeneeded, so a missing DB is never committed by the extension.
+      }
+    }
+
+    const openResult = await new Promise((resolve, reject) => {
+      const request = indexedDB.open(databaseName);
+      let missingDatabase = false;
+
+      request.onupgradeneeded = () => {
+        missingDatabase = true;
+        try {
+          request.transaction?.abort();
+        } catch {}
+      };
+      request.onerror = () => {
+        if (missingDatabase || request.error?.name === 'AbortError') {
+          resolve({ database: null, missing: true });
+          return;
+        }
+        reject(request.error || new Error('IndexedDB open failed.'));
+      };
+      request.onblocked = () => reject(new Error('IndexedDB open blocked.'));
+      request.onsuccess = () => {
+        if (missingDatabase) {
+          try {
+            request.result?.close?.();
+          } catch {}
+          resolve({ database: null, missing: true });
+          return;
+        }
+        resolve({ database: request.result, missing: false });
+      };
     });
 
-    if (!response?.ok) {
-      throw new Error(response?.error || 'Не удалось прочитать IndexedDB страницы.');
+    if (openResult.missing || !openResult.database) {
+      return { found: false, reason: 'database-missing', databaseVersion: null, record: null };
     }
-    return response.result;
+
+    const database = openResult.database;
+    try {
+      if (!database.objectStoreNames.contains(storeName)) {
+        return {
+          found: false,
+          reason: 'store-missing',
+          databaseVersion: database.version,
+          record: null,
+        };
+      }
+
+      const record = await new Promise((resolve, reject) => {
+        const transaction = database.transaction(storeName, 'readonly');
+        const store = transaction.objectStore(storeName);
+        const request = store.get(key);
+        let value;
+        let requestCompleted = false;
+
+        request.onsuccess = () => {
+          value = request.result;
+          requestCompleted = true;
+        };
+        request.onerror = () => reject(request.error || new Error('IndexedDB get failed.'));
+        transaction.oncomplete = () => resolve(requestCompleted ? value : undefined);
+        transaction.onerror = () => reject(transaction.error || new Error('IndexedDB readonly transaction failed.'));
+        transaction.onabort = () => reject(transaction.error || new Error('IndexedDB readonly transaction aborted.'));
+      });
+
+      return {
+        found: record !== undefined,
+        reason: record === undefined ? 'record-missing' : null,
+        databaseVersion: database.version,
+        record: record === undefined ? null : record,
+      };
+    } finally {
+      database.close();
+    }
   }
 
   function fingerprintLocalCacheRecord(record) {
@@ -1290,7 +1378,7 @@
         requireStable,
       });
 
-      const result = await sendIndexedDbGet(config);
+      const result = await readIndexedDbRecordReadonly(config);
       if (result?.found) {
         let fingerprint = { signature: null, recordBytes: null };
         try {
@@ -1473,6 +1561,7 @@
       name: runtime.adapter.displayName,
       score: detection.score,
       acquisitionMode: 'local-cache',
+      localCacheAccess: runtime.adapter.localCacheAccess || 'isolated-content-script-readonly',
       reloadBeforeRead: runtime.adapter.reloadBeforeLocalCacheRead === true,
     });
     log.write('LOCAL_CACHE_SELECTED', {
@@ -1481,6 +1570,8 @@
       key: config.key,
       sessionId: config.sessionId || null,
       access: 'read-only',
+      executionWorld: 'ISOLATED',
+      reader: 'content-script-indexeddb',
     });
 
     if (syncState) {
@@ -1708,6 +1799,7 @@
     return false;
   }
 
+
   async function runNetworkAdapter(currentSettings, detection) {
     runtime.networkMode = true;
     runtime.adapter = detection.adapter;
@@ -1743,9 +1835,13 @@
         type: CAPTURE_START_MESSAGE,
         adapterId: runtime.adapter.id,
         adapterName: runtime.adapter.displayName || runtime.adapter.id,
+        adapterVariant: runtime.adapter.variant || null,
         adapterScore: detection.score,
         urlPattern: config.urlPattern,
         requestMethod: config.method || null,
+        requestResourceType: config.resourceType || null,
+        responseProcessor: config.responseProcessor || null,
+        expectedShareId: config.expectedShareId || null,
         timeoutMs: config.timeoutMs || 60_000,
         totalPasses,
         minDelayMs: currentSettings.minDelayMs,
@@ -1835,7 +1931,7 @@
 
     log.importEntries?.(releaseState?.events || state.events || []);
 
-    runtime.panel.setStatus('Разбираю JSON...');
+    runtime.panel.setStatus('Разбираю данные...');
     const parsed = runtime.adapter.parseNetworkCaptures(state.captures);
     const finalStats = parsed.stats;
     const diagnostics = parsed.diagnostics || {};
@@ -1858,7 +1954,7 @@
       });
     }
 
-    log.write('JSON_PARSED', {
+    log.write(runtime.adapter.parseEvent || 'JSON_PARSED', {
       adapter: runtime.adapter.id,
       captures: state.captures.length,
       sourceMessages: diagnostics.sourceMessages ?? null,

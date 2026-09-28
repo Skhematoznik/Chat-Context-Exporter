@@ -1,4 +1,13 @@
+importScripts('../adapters/chatgpt/shared-wire-parser.js');
+
 'use strict';
+
+const chatGptShareWireParser = globalThis.__chatContextExporterShareWireParser;
+const CAPTURE_RESPONSE_PROCESSORS = Object.freeze({
+  'chatgpt-shared-document': (body, session) => chatGptShareWireParser.parseDocumentBody(body, {
+    expectedShareId: session.expectedShareId,
+  }),
+});
 
 const CONTENT_SCRIPTS = [
   'src/core/namespace.js',
@@ -27,7 +36,6 @@ const CAPTURE_GET_STATE_MESSAGE = 'chat-context-exporter:capture:get-state';
 const CAPTURE_CANCEL_MESSAGE = 'chat-context-exporter:capture:cancel';
 const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
 const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
-const PAGE_INDEXEDDB_GET_MESSAGE = 'chat-context-exporter:indexeddb:get';
 const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
 const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
 const LOCAL_CACHE_SYNC_RELEASE_MESSAGE = 'chat-context-exporter:local-cache-sync:release';
@@ -44,7 +52,6 @@ const LOCAL_CACHE_SYNC_TTL_MS = 2 * 60 * 1000;
 const LOCAL_CACHE_SYNC_STORAGE_PREFIX = 'chat-context-exporter:local-cache-sync:';
 const saveRequests = new Map();
 const captureSessions = new Map();
-
 function nowMs() {
   return Date.now();
 }
@@ -103,6 +110,7 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
 async function injectRuntime(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
+    world: 'ISOLATED',
     files: CONTENT_SCRIPTS,
   });
 }
@@ -351,6 +359,27 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
       throw new Error(`Тело ответа превышает лимит ${MAX_CAPTURE_BODY_BYTES} байт.`);
     }
 
+    let processed = null;
+    const responseProcessor = session.responseProcessor
+      ? CAPTURE_RESPONSE_PROCESSORS[session.responseProcessor]
+      : null;
+    if (responseProcessor) {
+      processed = responseProcessor(body, session);
+      appendCaptureEvent(session, 'CHATGPT_SHARE_DOCUMENT_PARSED', {
+        pass: session.pass,
+        requestId,
+        wireFormat: processed?.transport?.wireFormat || null,
+        tableEntries: processed?.transport?.tableEntries ?? null,
+        rawNodes: processed?.rawNodes ?? null,
+        mappingNodes: processed?.mappingNodes ?? null,
+        uniqueRawNodeIds: processed?.uniqueRawNodeIds ?? null,
+        currentNodeMatchesLast: Boolean(processed?.currentNode && processed?.currentNode === processed?.lastNodeId),
+        messages: processed?.stats?.total ?? null,
+        user: processed?.stats?.user ?? null,
+        assistant: processed?.stats?.assistant ?? null,
+      });
+    }
+
     session.currentPassCaptured = true;
     session.captures.push({
       pass: session.pass,
@@ -363,7 +392,7 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
       encodedDataLength: Number.isFinite(params?.encodedDataLength)
         ? params.encodedDataLength
         : null,
-      body,
+      ...(processed ? { processed } : { body }),
     });
 
     appendCaptureEvent(session, 'NETWORK_BODY_CAPTURED', {
@@ -409,6 +438,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       return;
     }
     if (session.requestMethod && requestMethod !== session.requestMethod) {
+      return;
+    }
+    if (session.requestResourceType && String(params?.type || '') !== session.requestResourceType) {
       return;
     }
 
@@ -524,6 +556,16 @@ async function startCaptureSession(tabId, message) {
     requestMethod: typeof message.requestMethod === 'string' && message.requestMethod.trim()
       ? message.requestMethod.trim().toUpperCase()
       : null,
+    requestResourceType: typeof message.requestResourceType === 'string' && message.requestResourceType.trim()
+      ? message.requestResourceType.trim()
+      : null,
+    responseProcessor: typeof message.responseProcessor === 'string'
+      && Object.prototype.hasOwnProperty.call(CAPTURE_RESPONSE_PROCESSORS, message.responseProcessor)
+      ? message.responseProcessor
+      : null,
+    expectedShareId: typeof message.expectedShareId === 'string' && message.expectedShareId.trim()
+      ? message.expectedShareId.trim()
+      : null,
     startedAt: nowMs(),
     phase: 'attaching',
     pass: 0,
@@ -564,12 +606,21 @@ async function startCaptureSession(tabId, message) {
     name: typeof message.adapterName === 'string' ? message.adapterName : session.adapterId,
     score: Number(message.adapterScore) || 0,
     acquisitionMode: 'network',
+    variant: typeof message.adapterVariant === 'string' ? message.adapterVariant : null,
   });
   appendCaptureEvent(session, 'CAPTURE_METHOD_SELECTED', {
     method: 'chrome.debugger',
     protocolDomain: 'Network',
     urlPattern: session.urlPattern,
     requestMethod: session.requestMethod,
+    requestResourceType: session.requestResourceType,
+    responseProcessor: session.responseProcessor,
+    expectedShareId: session.expectedShareId,
+    passive: true,
+    pageExecution: false,
+    ownNetworkRequests: false,
+    requestInterception: false,
+    responseModification: false,
   });
   appendCaptureEvent(session, 'DEBUGGER_ATTACH_STARTED', {});
 
@@ -731,82 +782,6 @@ async function handleLocalCacheSyncMessage(message, sender) {
   return { ok: false, error: 'Неизвестная команда локальной синхронизации.' };
 }
 
-async function readIndexedDbRecordInMainWorld(tabId, message) {
-  const databaseName = typeof message.databaseName === 'string' ? message.databaseName.trim() : '';
-  const storeName = typeof message.storeName === 'string' ? message.storeName.trim() : '';
-  const key = typeof message.key === 'string' ? message.key : message.key;
-
-  if (!databaseName || !storeName || key === undefined || key === null) {
-    return { ok: false, error: 'Некорректные параметры чтения IndexedDB.' };
-  }
-
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: 'MAIN',
-    func: async (dbName, objectStoreName, recordKey) => {
-      if (!globalThis.indexedDB) {
-        return { found: false, reason: 'indexeddb-unavailable' };
-      }
-
-      if (typeof indexedDB.databases === 'function') {
-        const databases = await indexedDB.databases();
-        const existing = databases.find((item) => item?.name === dbName);
-        if (!existing) {
-          return { found: false, reason: 'database-missing' };
-        }
-      }
-
-      const database = await new Promise((resolve, reject) => {
-        const request = indexedDB.open(dbName);
-        request.onerror = () => reject(request.error || new Error('IndexedDB open failed.'));
-        request.onupgradeneeded = () => {
-          try {
-            request.transaction?.abort();
-          } catch {}
-          reject(new Error('IndexedDB database did not exist before read.'));
-        };
-        request.onsuccess = () => resolve(request.result);
-      });
-
-      try {
-        if (!database.objectStoreNames.contains(objectStoreName)) {
-          return {
-            found: false,
-            reason: 'store-missing',
-            databaseVersion: database.version,
-          };
-        }
-
-        const record = await new Promise((resolve, reject) => {
-          const transaction = database.transaction(objectStoreName, 'readonly');
-          const store = transaction.objectStore(objectStoreName);
-          const request = store.get(recordKey);
-          request.onerror = () => reject(request.error || new Error('IndexedDB get failed.'));
-          request.onsuccess = () => resolve(request.result);
-          transaction.onabort = () => reject(transaction.error || new Error('IndexedDB readonly transaction aborted.'));
-        });
-
-        return {
-          found: record !== undefined,
-          reason: record === undefined ? 'record-missing' : null,
-          databaseVersion: database.version,
-          record: record === undefined ? null : record,
-        };
-      } finally {
-        database.close();
-      }
-    },
-    args: [databaseName, storeName, key],
-  });
-
-  const result = results?.[0]?.result;
-  if (!result || typeof result !== 'object') {
-    return { ok: false, error: 'Чтение IndexedDB не вернуло результат.' };
-  }
-
-  return { ok: true, result };
-}
-
 async function handleCaptureMessage(message, sender) {
   const tabId = sender.tab?.id;
   if (!tabId) {
@@ -875,6 +850,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+
   if (
     message.type === LOCAL_CACHE_SYNC_START_MESSAGE
     || message.type === LOCAL_CACHE_SYNC_GET_STATE_MESSAGE
@@ -891,23 +867,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message.type === PAGE_INDEXEDDB_GET_MESSAGE) {
-    const tabId = sender.tab?.id;
-    if (!tabId) {
-      sendResponse({ ok: false, error: 'Не удалось определить вкладку для чтения IndexedDB.' });
-      return true;
-    }
-
-    readIndexedDbRecordInMainWorld(tabId, message)
-      .then((response) => sendResponse(response))
-      .catch((error) => {
-        sendResponse({
-          ok: false,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-    return true;
-  }
 
   if (
     message.type === CAPTURE_START_MESSAGE

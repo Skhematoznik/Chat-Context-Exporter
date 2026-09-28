@@ -460,6 +460,7 @@
     id: 'deepseek',
     displayName: 'DeepSeek',
     acquisitionMode: 'local-cache',
+    localCacheAccess: 'isolated-content-script-readonly',
     reloadBeforeLocalCacheRead: true,
     supportsMessageCollection: true,
     panelFields: Object.freeze({

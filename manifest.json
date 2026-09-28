@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Chat Context Exporter",
-  "version": "0.7.1",
-  "description": "Локальный экспорт AI-диалогов: Grok/Claude через пассивный network capture, DeepSeek через reload + read-only локальный кеш, ChatGPT через текущий адаптер.",
+  "version": "0.8.1",
+  "description": "Локальный read-only экспорт AI-диалогов: Grok/Claude/ChatGPT Shared passive network, DeepSeek ISOLATED readonly IndexedDB.",
   "icons": {
     "16": "assets/icons/icon16.png",
     "32": "assets/icons/icon32.png",
@@ -30,5 +30,5 @@
     "downloads",
     "debugger"
   ],
-  "version_name": "0.7.1"
+  "version_name": "0.8.1"
 }

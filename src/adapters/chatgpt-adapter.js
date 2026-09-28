@@ -47,8 +47,11 @@
     id: 'chatgpt',
     displayName: 'ChatGPT',
     scrollerLabel: activeProfile?.scrollerLabel || 'ChatGPT conversation',
-    supportsMessageCollection: Boolean(activeProfile),
+    supportsMessageCollection: activeProfile?.supportsMessageCollection !== false,
+    acquisitionMode: activeProfile?.acquisitionMode || null,
+    panelFields: activeProfile?.panelFields || Object.freeze({}),
     variant: activeProfile?.variant || 'unknown',
+    parseEvent: activeProfile?.parseEvent || null,
     scrollMode: activeProfile?.scrollMode || 'normal',
     selectors: activeProfile?.selectors || Object.freeze({}),
 
@@ -79,6 +82,8 @@
     getCollectionCoverage: delegate('getCollectionCoverage'),
     getHistoryStartState: delegate('getHistoryStartState'),
     getHistoryEndState: delegate('getHistoryEndState'),
+    getNetworkCaptureConfig: delegate('getNetworkCaptureConfig'),
+    parseNetworkCaptures: delegate('parseNetworkCaptures'),
 
     isHistoryStartReached(scroller) {
       return this.getHistoryStartState(scroller)?.reached ?? false;

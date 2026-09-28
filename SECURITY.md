@@ -2,21 +2,47 @@
 
 ## Модель безопасности
 
-Расширение работает только после явного действия пользователя в текущей вкладке.
+Расширение работает только после явного действия пользователя в текущей вкладке. Acquisition policy проекта — passive/read-only.
 
-Grok и Claude используют permission `debugger` для пассивного CDP Network capture. DeepSeek 0.7.1 выполняет обычный reload текущей страницы для штатной синхронизации локальной истории сайтом, а затем использует `scripting.executeScript` в MAIN world только для read-only чтения конкретной IndexedDB-записи текущего `chat_session_id`.
+Grok и Claude используют permission `debugger` только для пассивного CDP Network capture: подключение к текущей вкладке, `Network.enable`, обычный reload, наблюдение за штатными запросами страницы, `Network.getResponseBody`, detach. Они не создают собственных backend-запросов.
 
-Без отдельного архитектурного решения запрещено добавлять:
+DeepSeek 0.7.2 выполняет обычный reload текущей страницы для штатной синхронизации локальной истории самим сайтом, после чего extension content script в `ISOLATED` world read-only читает конкретную IndexedDB-запись текущего `chat_session_id`. MAIN-world bridge отсутствует. ChatGPT Shared 0.8.1 использует только passive CDP `Network` observation + ordinary reload; захватывается основной GET Document текущей `/share/<id>` страницы, request interception и page-world execution не используются.
 
-- собственные `fetch` / `XMLHttpRequest` к внутренним API AI-сервисов;
+### Разрешено
+
+- extension code в `ISOLATED` world;
+- read-only DOM/browser-storage access;
+- IndexedDB transaction только `readonly`;
+- passive `chrome.debugger` observation и чтение response body, уже полученного страницей;
+- обычный reload/scroll браузера, когда это требуется acquisition-моделью;
+- локальный parsing/export и extension-owned UI.
+
+### Запрещено
+
+- `world: "MAIN"`;
+- CDP `Runtime.evaluate` или иное выполнение собственного JavaScript в page world;
+- вставка `<script>` и вызов внутренних page/app функций;
+- собственные `fetch` / `XMLHttpRequest` / `WebSocket` к внутренним API AI-сервисов;
 - извлечение cookies/access/session tokens для собственных запросов;
-- request/response modification;
+- request/response/header/payload modification;
 - monkey-patching page network APIs;
-- manipulation React/Next/internal application state для принудительной истории;
-- `put` / `delete` / `clear` в site IndexedDB и автоматическое очищение кеша сайта;
+- manipulation React/Next/Vue/internal application state;
+- `put` / `add` / `delete` / `clear` / `deleteDatabase` в site storage;
+- автоматическое очищение site cache/storage;
 - обход iframe/CORS/browser security.
 
 Network adapter должен читать только ответы, которые сама страница уже получает штатно. Local-cache adapter должен выполнять только readonly-чтение данных, которые сайт уже сохранил сам.
+
+
+### ChatGPT Shared 0.8.1 guardrails
+
+- matcher ограничен точным текущим `https://chatgpt.com/share/<shareId>` и HTTP method `GET`;
+- `Network.getResponseBody` вызывается только после `Network.loadingFinished`;
+- HTML разбирается как строка данных; embedded JavaScript не исполняется;
+- `Runtime.evaluate`, `MAIN` world, `Fetch.enable`, request interception/mutation и response mutation отсутствуют;
+- request/response headers, Cookie, Set-Cookie, Authorization и POST body не читаются/не логируются;
+- полный Document body не записывается в technical log и не сохраняется отдельным diagnostic artifact;
+- после локального parsing в runtime передается только normalized snapshot разговора.
 
 ## Bug reports
 
