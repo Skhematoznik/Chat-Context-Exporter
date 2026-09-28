@@ -398,7 +398,11 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   if (method === 'Network.requestWillBeSent') {
     const url = params?.request?.url || '';
+    const requestMethod = String(params?.request?.method || '').toUpperCase();
     if (!session.matcher.test(url)) {
+      return;
+    }
+    if (session.requestMethod && requestMethod !== session.requestMethod) {
       return;
     }
 
@@ -406,7 +410,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     const requestInfo = {
       requestId: params.requestId,
       url,
-      method: params.request.method || null,
+      method: requestMethod || null,
       status: null,
       mimeType: null,
       handled: false,
@@ -511,6 +515,9 @@ async function startCaptureSession(tabId, message) {
     tabId,
     matcher,
     urlPattern: String(message.urlPattern || ''),
+    requestMethod: typeof message.requestMethod === 'string' && message.requestMethod.trim()
+      ? message.requestMethod.trim().toUpperCase()
+      : null,
     startedAt: nowMs(),
     phase: 'attaching',
     pass: 0,
@@ -527,6 +534,8 @@ async function startCaptureSession(tabId, message) {
     attached: false,
     detaching: false,
     error: null,
+    lastReloadCompletedAt: 0,
+    lastReloadCompletedPass: 0,
   };
   captureSessions.set(tabId, session);
 
@@ -554,6 +563,7 @@ async function startCaptureSession(tabId, message) {
     method: 'chrome.debugger',
     protocolDomain: 'Network',
     urlPattern: session.urlPattern,
+    requestMethod: session.requestMethod,
   });
   appendCaptureEvent(session, 'DEBUGGER_ATTACH_STARTED', {});
 
@@ -723,11 +733,19 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     return;
   }
 
-  appendCaptureEvent(session, 'PAGE_RELOAD_COMPLETED', {
-    pass: session.pass,
-    totalPasses: session.totalPasses,
-    phase: session.phase,
-  });
+  const completedAt = nowMs();
+  const duplicateCompletion = session.lastReloadCompletedPass === session.pass
+    && completedAt - session.lastReloadCompletedAt < 500;
+
+  if (!duplicateCompletion) {
+    session.lastReloadCompletedPass = session.pass;
+    session.lastReloadCompletedAt = completedAt;
+    appendCaptureEvent(session, 'PAGE_RELOAD_COMPLETED', {
+      pass: session.pass,
+      totalPasses: session.totalPasses,
+      phase: session.phase,
+    });
+  }
   void injectRuntime(tabId).catch(() => {});
 });
 

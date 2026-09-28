@@ -8,7 +8,7 @@
 
 ## Network adapter
 
-Предпочтительный путь после линии 0.5.x:
+Предпочтительный путь:
 
 ```text
 DebuggerTransport
@@ -21,26 +21,36 @@ DebuggerTransport
 Network adapter определяет:
 
 - hostname/service detection;
-- URL pattern нужного штатного ответа;
+- URL pattern и HTTP method нужного штатного ответа;
 - проверку JSON schema;
-- ID, порядок/parent-chain;
+- стабильные ID;
+- parent-chain/tree и правило выбора активной ветки;
 - роли;
 - служебные/transient элементы;
 - критерий полноты;
-- преобразование в normalized messages.
-- надежный timestamp сообщения, если он присутствует в штатном payload.
+- надежный timestamp сообщения;
+- преобразование в normalized messages;
+- adapter-specific диагностические события.
 
 Transport отвечает только за attach/Network.enable/reload/request tracking/getResponseBody/detach и не знает структуру JSON конкретного сервиса.
+
+## Tree
+
+Если endpoint возвращает дерево, наличие массива сообщений не означает, что нужно экспортировать весь массив. Адаптер должен использовать фактический active/current leaf и parent links. Claude 0.6.0 строит текущую ветку от `current_leaf_message_uuid` к root.
 
 ## Scroll
 
 Scrolling не является обязательной частью адаптера. Он используется только после фактического подтверждения, что сервис получает историю порциями и штатно запрашивает следующую часть при прокрутке.
 
-Если полный snapshot приходит при initial load, адаптер не должен выполнять скроллинг.
+Если полный snapshot приходит при initial load, адаптер не должен выполнять scrolling.
 
 ## Дополнительные проходы
 
-Дополнительный проход — повтор acquisition-процесса конкретного адаптера. Network adapter должен дедуплицировать данные по стабильным ID.
+Дополнительный проход — повтор acquisition-процесса конкретного адаптера. Network adapter объединяет результаты по стабильным ID и не должен терять сообщения, найденные только в одном из проходов.
+
+## Панель
+
+Адаптер может объявлять только нужные ему presentation capabilities. Если full-snapshot adapter не использует scrolling, строки `Шаг` и `Позиция` не отображаются вообще, а не заполняются `—`.
 
 ## DOM adapter
 

@@ -1134,13 +1134,14 @@
   }
 
   function configureNetworkPanel(totalPasses) {
+    const adapterFields = runtime.adapter?.panelFields || {};
     runtime.panel?.configureFields?.({
       assistant: true,
       method: false,
       messages: true,
       pass: totalPasses > 1,
-      iteration: false,
-      position: false,
+      iteration: adapterFields.iteration === true,
+      position: adapterFields.position === true,
     });
   }
 
@@ -1242,6 +1243,7 @@
         adapterName: runtime.adapter.displayName || runtime.adapter.id,
         adapterScore: detection.score,
         urlPattern: config.urlPattern,
+        requestMethod: config.method || null,
         timeoutMs: config.timeoutMs || 60_000,
         totalPasses,
         minDelayMs: currentSettings.minDelayMs,
@@ -1347,7 +1349,7 @@
         updated: passStats.updated,
         duplicates: passStats.duplicates,
         malformed: passStats.malformed,
-        total: finalStats.total,
+        total: passStats.totalAfterPass ?? finalStats.total,
         user: finalStats.user,
         assistant: finalStats.assistant,
         other: finalStats.other,
@@ -1357,31 +1359,15 @@
     log.write('JSON_PARSED', {
       adapter: runtime.adapter.id,
       captures: state.captures.length,
-      responses: diagnostics.responses ?? null,
-      uniqueResponseIds: diagnostics.uniqueResponseIds ?? null,
-    });
-    log.write('GROK_CHAIN_STATUS', {
-      responses: diagnostics.responses ?? null,
-      uniqueResponseIds: diagnostics.uniqueResponseIds ?? null,
-      internalLinkCount: diagnostics.internalLinkCount ?? null,
-      externalRootParentId: diagnostics.externalRootParentId ?? null,
-      chainComplete: diagnostics.chainComplete === true,
-      control: diagnostics.control ?? 0,
-      partial: diagnostics.partial ?? 0,
-      unknownSender: diagnostics.unknownSender ?? 0,
-      empty: diagnostics.empty ?? 0,
-      attachmentMessages: diagnostics.attachmentMessages ?? 0,
-      attachmentCount: diagnostics.attachmentCount ?? 0,
-      timestampedMessages: diagnostics.timestampedMessages ?? 0,
-      missingTimestampMessages: diagnostics.missingTimestampMessages ?? 0,
+      sourceMessages: diagnostics.sourceMessages ?? null,
+      uniqueMessageIds: diagnostics.uniqueMessageIds ?? null,
     });
 
-    if ((diagnostics.attachmentCount || 0) > 0) {
-      log.write('GROK_ATTACHMENT_DATA_PRESENT', {
-        messages: diagnostics.attachmentMessages,
-        attachments: diagnostics.attachmentCount,
-        note: 'attachment payload mapping is not yet validated in network adapter',
-      });
+    for (const entry of diagnostics.logEntries || []) {
+      if (!entry?.event) {
+        continue;
+      }
+      log.write(entry.event, entry.details || {});
     }
 
     runtime.panel.setMessageCount(finalStats.total);

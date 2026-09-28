@@ -101,6 +101,7 @@
         }
       }
 
+      stats.totalAfterPass = records.size;
       passStats.push(stats);
     }
 
@@ -283,6 +284,10 @@
     displayName: 'Grok',
     acquisitionMode: 'network',
     supportsMessageCollection: true,
+    panelFields: Object.freeze({
+      iteration: false,
+      position: false,
+    }),
 
     detect() {
       if (location.hostname === 'grok.com' || location.hostname.endsWith('.grok.com')) {
@@ -294,6 +299,7 @@
     getNetworkCaptureConfig() {
       return {
         urlPattern: LOAD_RESPONSES_PATTERN,
+        method: 'POST',
         timeoutMs: 60_000,
       };
     },
@@ -310,12 +316,42 @@
         },
         stats: normalized.stats,
         diagnostics: {
+          sourceMessages: chain.ordered.length,
+          uniqueMessageIds: records.size,
           responses: chain.ordered.length,
           uniqueResponseIds: records.size,
           internalLinkCount: chain.internalLinkCount,
           externalRootParentId: chain.externalRootParentId,
           chainComplete: true,
           passStats,
+          logEntries: [
+            {
+              event: 'GROK_CHAIN_STATUS',
+              details: {
+                responses: chain.ordered.length,
+                uniqueResponseIds: records.size,
+                internalLinkCount: chain.internalLinkCount,
+                externalRootParentId: chain.externalRootParentId,
+                chainComplete: true,
+                control: normalized.stats.control,
+                partial: normalized.stats.partial,
+                unknownSender: normalized.stats.unknownSender,
+                empty: normalized.stats.empty,
+                attachmentMessages: normalized.stats.attachmentMessages,
+                attachmentCount: normalized.stats.attachmentCount,
+                timestampedMessages: normalized.stats.timestampedMessages,
+                missingTimestampMessages: normalized.stats.missingTimestampMessages,
+              },
+            },
+            ...(normalized.stats.attachmentCount > 0 ? [{
+              event: 'GROK_ATTACHMENT_DATA_PRESENT',
+              details: {
+                messages: normalized.stats.attachmentMessages,
+                attachments: normalized.stats.attachmentCount,
+                note: 'attachment payload mapping is not yet validated in network adapter',
+              },
+            }] : []),
+          ],
           ...normalized.stats,
         },
       };

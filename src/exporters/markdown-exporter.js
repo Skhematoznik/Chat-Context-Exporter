@@ -221,12 +221,11 @@
         sections.push('---');
       }
 
-      sections.push(`***${formatRole(message.role)}***`);
-
+      const roleLabel = `***${formatRole(message.role)}***`;
       const timestamp = formattedTimestamps[index];
-      if (timestamp) {
-        sections.push(escapeHeadingText(timestamp));
-      }
+      sections.push(timestamp
+        ? `${roleLabel} — *${escapeHeadingText(timestamp)}*`
+        : roleLabel);
 
       const content = renderBlocks(message.blocks || []);
       if (content) {

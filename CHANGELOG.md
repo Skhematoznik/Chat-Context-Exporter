@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0 — 2026-09-28
+
+Добавлен второй полностью сетевой адаптер — Claude.
+
+- старый Claude DOM adapter удален и заменен network adapter без DOM fallback;
+- Claude захватывает штатный GET `chat_conversations/<id>?tree=True&rendering_mode=messages...` через общий `chrome.debugger` transport;
+- несколько проходов объединяются по `chat_messages[].uuid`; более полная версия того же сообщения имеет приоритет;
+- активный разговор строится от `current_leaf_message_uuid` по `parent_message_uuid`, поэтому неактивные ветки tree не экспортируются;
+- подтвержденный fixture содержит 28 сообщений (14 user + 14 assistant), timestamps 28/28, `stop_reason=end_turn` 14/14, без разрывов parent-chain;
+- Claude `content[].type=text` экспортируется как исходный Markdown; неизвестные content types и attachment metadata диагностируются отдельно до появления реальных тестовых образцов;
+- transport получил необязательный HTTP method matcher: Grok ожидает POST, Claude — GET;
+- дублирующиеся `PAGE_RELOAD_COMPLETED`, пришедшие почти одновременно для одного прохода, подавляются в техническом логе;
+- network logging обобщен: common runtime пишет generic `JSON_PARSED`, а site-specific chain diagnostics возвращает сам adapter;
+- панель network adapters использует adapter presentation capabilities; full-snapshot Grok/Claude не показывают `Метод`, `Шаг`, `Позиция`;
+- Markdown role/timestamp объединены в одну строку: `***Пользователь*** — *DD.MM.YYYY HH:MM:SS*` и аналогично для ассистента;
+- Grok network acquisition/merge/chain validation функционально не менялись.
+
 ## 0.5.1 — 2026-09-28
 
 Зафиксирован первый рабочий Grok network adapter после многопроходных тестов.
