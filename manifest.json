@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Chat Context Exporter",
-  "version": "0.3.0",
-  "description": "Локальный экспорт контекста AI-диалогов из содержимого текущей страницы.",
+  "version": "0.5.1",
+  "description": "Локальный экспорт AI-диалогов: Grok через пассивный сетевой захват, остальные поддерживаемые сервисы через текущие адаптеры.",
   "icons": {
     "16": "assets/icons/icon16.png",
     "32": "assets/icons/icon32.png",
@@ -27,7 +27,8 @@
     "activeTab",
     "scripting",
     "storage",
-    "downloads"
+    "downloads",
+    "debugger"
   ],
-  "version_name": "0.3.0"
+  "version_name": "0.5.1"
 }

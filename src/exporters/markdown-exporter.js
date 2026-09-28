@@ -64,6 +64,8 @@
           return `~~${renderInline(node.children, options)}~~`;
         case 'code':
           return renderInlineCode(node.value);
+        case 'math':
+          return `$${String(node.value ?? '').trim()}$`;
         case 'link':
           return `[${renderInline(node.children, options)}](${escapeLinkDestination(node.href)})`;
         default:
@@ -149,6 +151,10 @@
         return renderTable(block);
       case 'separator':
         return '---';
+      case 'mathBlock':
+        return `$$\n${String(block.value ?? '').trim()}\n$$`;
+      case 'markdown':
+        return String(block.value ?? '').trim();
       default:
         return '';
     }
@@ -171,18 +177,56 @@
     return 'Сообщение';
   }
 
+  function formatConversationStart(value) {
+    if (!value) {
+      return null;
+    }
+
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) {
+      return String(value).trim() || null;
+    }
+
+    const pad = (number) => String(number).padStart(2, '0');
+    return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function formatMessageTimestamp(value) {
+    if (!value) {
+      return null;
+    }
+
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) {
+      return String(value).trim() || null;
+    }
+
+    const pad = (number) => String(number).padStart(2, '0');
+    return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+
   function exportConversation(conversation) {
     const title = escapeHeadingText(conversation.title || 'Экспорт диалога');
     const sections = [`# ${title}`];
     const messages = conversation.messages || [];
+    const formattedTimestamps = messages.map((message) => formatMessageTimestamp(message.timestamp));
+    const allMessagesTimestamped = messages.length > 0 && formattedTimestamps.every(Boolean);
+    const startedAt = allMessagesTimestamped ? null : formatConversationStart(conversation.startedAt);
+    if (startedAt) {
+      sections.push(escapeHeadingText(startedAt));
+    }
 
     messages.forEach((message, index) => {
       if (index > 0) {
         sections.push('---');
       }
 
-      const timestampSuffix = message.timestamp ? ` — ${escapeHeadingText(message.timestamp)}` : '';
-      sections.push(`**${formatRole(message.role)}${timestampSuffix}**`);
+      sections.push(`***${formatRole(message.role)}***`);
+
+      const timestamp = formattedTimestamps[index];
+      if (timestamp) {
+        sections.push(escapeHeadingText(timestamp));
+      }
 
       const content = renderBlocks(message.blocks || []);
       if (content) {

@@ -59,8 +59,11 @@
     panel: null,
     adapter: null,
     collector: null,
+    conversationStartedAt: null,
+    conversationStartChecked: false,
     operationStep: 0,
     stop: null,
+    networkMode: false,
   };
 
   globalThis[APP_KEY] = runtime;
@@ -71,8 +74,14 @@
   const TOP_STABILITY_CHECKS = 2;
   const BOTTOM_STABILITY_CHECKS = 2;
   const SEMANTIC_BOUNDARY_MAX_STABLE_CHECKS = 5;
+  const SEMANTIC_BOUNDARY_IDLE_TIMEOUT_MS = 45_000;
   const SCROLL_MOVEMENT_EPSILON_PX = 1;
   const MAX_CONSECUTIVE_STALLED_SCROLLS = 3;
+  const CAPTURE_START_MESSAGE = 'chat-context-exporter:capture:start';
+  const CAPTURE_GET_STATE_MESSAGE = 'chat-context-exporter:capture:get-state';
+  const CAPTURE_CANCEL_MESSAGE = 'chat-context-exporter:capture:cancel';
+  const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
+  const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
 
   async function resolveSettings() {
     if (runtime.settings) {
@@ -134,9 +143,19 @@
     return runtime.operationStep;
   }
 
+
+  function getScrollMode() {
+    return runtime.adapter?.scrollMode === 'reverse' ? 'reverse' : 'normal';
+  }
+
   function setPanelScrollState(element) {
     const state = scroller.readScrollState(element);
-    runtime.panel?.setPosition(state.top, state.height, state.client);
+    const mode = getScrollMode();
+    const bounds = scroller.getScrollBounds(element, mode);
+    const panelTop = mode === 'reverse'
+      ? state.top - bounds.start
+      : state.top;
+    runtime.panel?.setPosition(panelTop, state.height, state.client);
     return state;
   }
 
@@ -161,7 +180,7 @@
 
   async function recoverStalledScroll({ direction, phase, step, command, scrollContainer }) {
     const beforeRecovery = scroller.readScrollState(scrollContainer);
-    const recovery = scroller.scrollToDirect(scrollContainer, command.target);
+    const recovery = scroller.scrollToDirect(scrollContainer, command.target, getScrollMode());
 
     log.write('SCROLL_RECOVERY', {
       phase,
@@ -261,6 +280,7 @@
     const pageTitle = String(document.title || '').trim() || `Диалог с ${runtime.adapter?.displayName || 'ассистентом'}`;
     const content = markdownExporter.exportConversation({
       title: pageTitle,
+      startedAt: runtime.conversationStartedAt,
       messages,
     });
     const filename = markdownExporter.createFilename(
@@ -275,6 +295,7 @@
       chars: content.length,
       filename,
       title: pageTitle,
+      startedAt: runtime.conversationStartedAt,
     });
 
     return {
@@ -285,6 +306,49 @@
       blocks: blockCount,
       emptyMessages,
     };
+  }
+
+  function buildNetworkMarkdownArtifact(conversation) {
+    const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
+    const blockCount = messages.reduce((sum, message) => sum + (Array.isArray(message.blocks) ? message.blocks.length : 0), 0);
+    const emptyMessages = messages.reduce((sum, message) => sum + ((message.blocks?.length || 0) === 0 ? 1 : 0), 0);
+    const pageTitle = String(document.title || '').trim() || `Диалог с ${runtime.adapter?.displayName || 'ассистентом'}`;
+    const content = markdownExporter.exportConversation({
+      title: pageTitle,
+      startedAt: conversation?.startedAt || null,
+      messages,
+    });
+    const filename = markdownExporter.createFilename(
+      pageTitle,
+      `Диалог с ${runtime.adapter?.displayName || 'ассистентом'}`,
+    );
+
+    log.write('MARKDOWN_BUILT', {
+      messages: messages.length,
+      blocks: blockCount,
+      emptyMessages,
+      chars: content.length,
+      filename,
+      title: pageTitle,
+      startedAt: conversation?.startedAt || null,
+    });
+
+    return {
+      filename,
+      content,
+      mimeType: 'text/markdown',
+      messages: messages.length,
+      blocks: blockCount,
+      emptyMessages,
+    };
+  }
+
+  async function sendCaptureMessage(message) {
+    const response = await chrome.runtime.sendMessage(message);
+    if (!response?.ok) {
+      throw new Error(response?.error || 'Ошибка канала сетевого захвата.');
+    }
+    return response;
   }
 
   async function saveMarkdownArtifact(artifact, reason, { saveAs = false } = {}) {
@@ -298,6 +362,14 @@
     const response = await fileSaver.saveTextFile({
       ...artifact,
       saveAs,
+      onAttempt(details) {
+        log.write('MARKDOWN_SAVE_ATTEMPT', {
+          reason,
+          filename: artifact.filename,
+          saveAs,
+          ...details,
+        });
+      },
     });
     log.write('MARKDOWN_SAVED', {
       reason,
@@ -335,7 +407,7 @@
           try {
             await saveMarkdownArtifact(artifact, 'manual', { saveAs: true });
             runtime.panel.hideActions();
-            runtime.panel.setStatus(`Сохранено: ${stats.total} сообщений.`);
+            runtime.panel.setStatus('Сохранено.');
             runtime.panel.setCloseTitle('Закрыть');
             runtime.panel.markDone();
             finish({ state: 'saved' });
@@ -373,6 +445,29 @@
       return;
     }
 
+    if (runtime.networkMode) {
+      runtime.aborted = true;
+      runtime.abortController.abort();
+      runtime.panel?.remove?.();
+      runtime.running = false;
+      void (async () => {
+        try {
+          const response = await sendCaptureMessage({ type: CAPTURE_CANCEL_MESSAGE });
+          if (response.state?.startedAt) {
+            runtime.startedAt = response.state.startedAt;
+            log.setStartedAt?.(runtime.startedAt);
+          }
+          log.importEntries?.(response.state?.events || []);
+        } catch (error) {
+          log.write('CAPTURE_CANCEL_FAILED', {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        await log.saveOnce('CANCELLED');
+      })();
+      return;
+    }
+
     log.write('CANCEL_REQUESTED', {
       duration: loggerModule.formatDuration(Date.now() - runtime.startedAt),
       messages: runtime.collector?.getStats?.().total ?? 0,
@@ -402,7 +497,12 @@
     let consecutiveStalledScrolls = 0;
     let addedDuringPhase = 0;
     let updatedDuringPhase = 0;
+    let semanticWaitStartedAt = null;
     const phaseStartedAt = Date.now();
+    const semanticIdleTimeoutMs = Math.max(
+      SEMANTIC_BOUNDARY_IDLE_TIMEOUT_MS,
+      Math.max(currentSettings.minDelayMs, currentSettings.maxDelayMs) * 3,
+    );
 
     const collectForPhase = (reason) => {
       const batch = collectVisible(reason, passContext);
@@ -448,7 +548,7 @@
         messages: runtime.collector?.getStats?.().total ?? 0,
       });
 
-      if (scroller.isAtTop(scrollContainer, TOP_EPSILON_PX)) {
+      if (scroller.isAtTop(scrollContainer, TOP_EPSILON_PX, getScrollMode())) {
         runtime.panel.setStatus(formatPassStatus(
           passContext,
           'Проверяю начало истории...',
@@ -463,7 +563,7 @@
 
         const afterWait = setPanelScrollState(scrollContainer);
         const batch = collectForPhase('top-check');
-        const topStillReached = scroller.isAtTop(scrollContainer, TOP_EPSILON_PX);
+        const topStillReached = scroller.isAtTop(scrollContainer, TOP_EPSILON_PX, getScrollMode());
         const heightUnchanged = previousTopHeight !== null && afterWait.height === previousTopHeight;
         const boundaryState = runtime.adapter.getHistoryStartState?.(scrollContainer) || null;
         const semanticReached = boundaryState ? Boolean(boundaryState.reached) : true;
@@ -496,10 +596,54 @@
           semanticStableChecks = 0;
         }
 
+        const hadTopBaseline = previousTopHeight !== null || previousTopSignature !== null;
+        const semanticProgress = hadTopBaseline && (
+          afterWait.height !== previousTopHeight
+          || boundarySignature !== previousTopSignature
+          || (batch?.added || 0) > 0
+          || (batch?.updated || 0) > 0
+        );
+
+        if (!semanticReached && topStillReached) {
+          if (semanticWaitStartedAt === null || semanticProgress) {
+            semanticWaitStartedAt = Date.now();
+            log.write(semanticProgress ? 'HISTORY_START_PROGRESS' : 'HISTORY_START_WAIT_STARTED', {
+              ...passContext,
+              iteration,
+              step,
+              scrollHeight: afterWait.height,
+              signature: boundarySignature,
+              topStatusPresent: boundaryState?.topStatusPresent ?? null,
+              topStatusText: boundaryState?.topStatusText ?? null,
+              timeoutMs: semanticIdleTimeoutMs,
+            });
+          }
+        } else if (semanticReached) {
+          semanticWaitStartedAt = null;
+        }
+
         previousTopHeight = afterWait.height;
         previousTopSignature = boundarySignature;
 
         if (topStillReached && stableTopChecks >= TOP_STABILITY_CHECKS && semanticReached) {
+          if (!runtime.conversationStartedAt) {
+            const startTimestamp = runtime.adapter.getConversationStartTimestamp?.(scrollContainer) || null;
+            if (startTimestamp) {
+              runtime.conversationStartedAt = startTimestamp;
+              log.write('CONVERSATION_START_TIMESTAMP', {
+                present: true,
+                value: startTimestamp,
+                variant: runtime.adapter.variant || null,
+              });
+            } else if (!runtime.conversationStartChecked) {
+              log.write('CONVERSATION_START_TIMESTAMP', {
+                present: false,
+                variant: runtime.adapter.variant || null,
+              });
+            }
+            runtime.conversationStartChecked = true;
+          }
+
           const phaseDurationMs = Date.now() - phaseStartedAt;
           log.write('SEEK_START_COMPLETED', {
             ...passContext,
@@ -525,12 +669,22 @@
           };
         }
 
-        if (
-          boundaryState
-          && stableTopChecks >= SEMANTIC_BOUNDARY_MAX_STABLE_CHECKS
-          && !semanticReached
-        ) {
-          throw new Error(`${runtime.adapter?.displayName || 'Чат'}: верхняя позиция стабильна, но DOM-признак начала истории не подтвержден.`);
+        if (boundaryState && topStillReached && !semanticReached && semanticWaitStartedAt !== null) {
+          const semanticIdleMs = Date.now() - semanticWaitStartedAt;
+          log.write('HISTORY_START_WAITING', {
+            ...passContext,
+            iteration,
+            step,
+            semanticIdleMs,
+            semanticIdleTimeoutMs,
+            topStatusPresent: boundaryState.topStatusPresent ?? null,
+            topStatusText: boundaryState.topStatusText ?? null,
+            scrollHeight: afterWait.height,
+          });
+
+          if (semanticIdleMs >= semanticIdleTimeoutMs) {
+            throw new Error(`${runtime.adapter?.displayName || 'Чат'}: начало истории не подтверждено после ${Math.ceil(semanticIdleMs / 1000)} секунд без прогресса.`);
+          }
         }
 
         continue;
@@ -540,13 +694,14 @@
       semanticStableChecks = 0;
       previousTopHeight = null;
       previousTopSignature = null;
+      semanticWaitStartedAt = null;
       runtime.panel.setStatus(formatPassStatus(
         passContext,
         'Едем к началу истории...',
         'еду к началу истории...',
       ));
 
-      const command = scroller.scrollUpOneStep(scrollContainer);
+      const command = scroller.scrollUpOneStep(scrollContainer, getScrollMode());
       const requestedStepPx = command.stepPx;
       log.write('SCROLL_UP', {
         ...passContext,
@@ -678,7 +833,7 @@
         messages: runtime.collector.getStats().total,
       });
 
-      if (scroller.isAtBottom(scrollContainer, BOTTOM_EPSILON_PX)) {
+      if (scroller.isAtBottom(scrollContainer, BOTTOM_EPSILON_PX, getScrollMode())) {
         runtime.panel.setStatus(formatPassStatus(
           passContext,
           'Проверяю конец истории...',
@@ -692,14 +847,39 @@
         }
 
         const afterWait = setPanelScrollState(scrollContainer);
-        const bottomStillReached = scroller.isAtBottom(scrollContainer, BOTTOM_EPSILON_PX);
+        const bottomStillReached = scroller.isAtBottom(scrollContainer, BOTTOM_EPSILON_PX, getScrollMode());
         const heightUnchanged = previousBottomHeight !== null && afterWait.height === previousBottomHeight;
+        const batch = collectForPhase('bottom-check');
         const boundaryState = runtime.adapter.getHistoryEndState?.(scrollContainer) || null;
-        const semanticReached = boundaryState ? Boolean(boundaryState.reached) : true;
+        const coverage = runtime.adapter.getCollectionCoverage?.(scrollContainer) || null;
+        const expectedTurnCount = Number.isFinite(Number(coverage?.expectedTurnCount))
+          ? Number(coverage.expectedTurnCount)
+          : null;
+        const observedTurnCount = Number.isFinite(Number(coverage?.observedTurnCount))
+          ? Number(coverage.observedTurnCount)
+          : null;
+        const resolvedTurnCount = Number.isFinite(Number(coverage?.resolvedTurnCount))
+          ? Number(coverage.resolvedTurnCount)
+          : null;
+        const missingTurnCount = Number.isFinite(Number(coverage?.missingTurnCount))
+          ? Number(coverage.missingTurnCount)
+          : null;
+        const unresolvedTurnCount = Number.isFinite(Number(coverage?.unresolvedTurnCount))
+          ? Number(coverage.unresolvedTurnCount)
+          : null;
+        const fallbackMessageTurnCount = Number.isFinite(Number(coverage?.fallbackMessageTurnCount))
+          ? Number(coverage.fallbackMessageTurnCount)
+          : null;
+        const transientTurnCount = Number.isFinite(Number(coverage?.transientTurnCount))
+          ? Number(coverage.transientTurnCount)
+          : null;
+        const collectedMessageCount = batch?.total ?? runtime.collector.getStats().total;
+        const collectionComplete = coverage?.collectionComplete !== false;
+        const boundaryReached = boundaryState ? Boolean(boundaryState.reached) : true;
+        const semanticReached = boundaryReached && collectionComplete;
         const boundarySignature = boundaryState?.signature ?? null;
         const signatureUnchanged = boundarySignature === null
           || (previousBottomSignature !== null && boundarySignature === previousBottomSignature);
-        const batch = collectForPhase('bottom-check');
 
         log.write('BOTTOM_CHECK', {
           ...passContext,
@@ -709,11 +889,42 @@
           heightUnchanged,
           signatureUnchanged,
           semanticReached,
+          collectionComplete,
+          expectedTurnCount,
+          observedTurnCount,
+          resolvedTurnCount,
+          missingTurnCount,
+          unresolvedTurnCount,
+          fallbackMessageTurnCount,
+          transientTurnCount,
+          transientTurnIds: coverage?.transientTurnIds || [],
+          transientTurnOrdinals: coverage?.transientTurnOrdinals || [],
+          missingTurnIds: coverage?.missingTurnIds || [],
+          missingTurnSkeletonIndexes: coverage?.missingTurnSkeletonIndexes || [],
+          unresolvedTurnOrdinals: coverage?.unresolvedTurnOrdinals || [],
+          collectedMessageCount,
           stableBottomChecks,
           physicalBottomChecks,
-          messages: batch?.total ?? runtime.collector.getStats().total,
+          messages: collectedMessageCount,
         });
-        logBoundaryState('HISTORY_END_SIGNAL', boundaryState ? { ...passContext, ...boundaryState } : null);
+        logBoundaryState('HISTORY_END_SIGNAL', boundaryState ? {
+          ...passContext,
+          ...boundaryState,
+          collectionComplete,
+          expectedTurnCount,
+          observedTurnCount,
+          resolvedTurnCount,
+          missingTurnCount,
+          unresolvedTurnCount,
+          fallbackMessageTurnCount,
+          transientTurnCount,
+          transientTurnIds: coverage?.transientTurnIds || [],
+          transientTurnOrdinals: coverage?.transientTurnOrdinals || [],
+          missingTurnIds: coverage?.missingTurnIds || [],
+          missingTurnSkeletonIndexes: coverage?.missingTurnSkeletonIndexes || [],
+          unresolvedTurnOrdinals: coverage?.unresolvedTurnOrdinals || [],
+          collectedMessageCount,
+        } : null);
 
         if (bottomStillReached && heightUnchanged && signatureUnchanged) {
           physicalBottomChecks += 1;
@@ -743,6 +954,14 @@
             effectiveMoves,
             addedDuringPhase,
             updatedDuringPhase,
+            collectionComplete,
+            expectedTurnCount,
+            observedTurnCount,
+            resolvedTurnCount,
+            missingTurnCount,
+            unresolvedTurnCount,
+            fallbackMessageTurnCount,
+            transientTurnCount,
             durationMs: phaseDurationMs,
             duration: loggerModule.formatDuration(phaseDurationMs),
           });
@@ -753,6 +972,14 @@
             effectiveMoves,
             addedDuringPhase,
             updatedDuringPhase,
+            collectionComplete,
+            expectedTurnCount,
+            observedTurnCount,
+            resolvedTurnCount,
+            missingTurnCount,
+            unresolvedTurnCount,
+            fallbackMessageTurnCount,
+            transientTurnCount,
             durationMs: phaseDurationMs,
           };
         }
@@ -762,6 +989,59 @@
           && physicalBottomChecks >= SEMANTIC_BOUNDARY_MAX_STABLE_CHECKS
           && !semanticReached
         ) {
+          if (!collectionComplete && expectedTurnCount !== null) {
+            const hasAnotherPass = passContext.pass < passContext.totalPasses;
+            const phaseDurationMs = Date.now() - phaseStartedAt;
+            const stats = runtime.collector.getStats();
+
+            log.write(hasAnotherPass ? 'COLLECT_PASS_INCOMPLETE' : 'COLLECT_INCOMPLETE', {
+              ...passContext,
+              total: stats.total,
+              user: stats.user,
+              assistant: stats.assistant,
+              expectedTurnCount,
+              observedTurnCount,
+              resolvedTurnCount,
+              missingTurnCount,
+              unresolvedTurnCount,
+              fallbackMessageTurnCount,
+              transientTurnCount,
+              boundaryReached,
+              transientTurnIds: coverage?.transientTurnIds || [],
+              transientTurnOrdinals: coverage?.transientTurnOrdinals || [],
+              missingTurnIds: coverage?.missingTurnIds || [],
+              missingTurnSkeletonIndexes: coverage?.missingTurnSkeletonIndexes || [],
+              unresolvedTurnIds: coverage?.unresolvedTurnIds || [],
+              unresolvedTurnOrdinals: coverage?.unresolvedTurnOrdinals || [],
+              nextPassAvailable: hasAnotherPass,
+              durationMs: phaseDurationMs,
+              duration: loggerModule.formatDuration(phaseDurationMs),
+            });
+
+            if (hasAnotherPass) {
+              return {
+                ...stats,
+                scrollCommands,
+                effectiveMoves,
+                addedDuringPhase,
+                updatedDuringPhase,
+                collectionComplete: false,
+                expectedTurnCount,
+                observedTurnCount,
+                resolvedTurnCount,
+                missingTurnCount,
+                unresolvedTurnCount,
+                fallbackMessageTurnCount,
+                transientTurnCount,
+                durationMs: phaseDurationMs,
+              };
+            }
+
+            const unresolvedSuffix = unresolvedTurnCount
+              ? `; не распознано содержимое ${unresolvedTurnCount} turn`
+              : '';
+            throw new Error(`${runtime.adapter?.displayName || 'Чат'}: достигнут конец истории, но полностью обработано ${resolvedTurnCount ?? 0} из ${expectedTurnCount} ожидаемых turn${unresolvedSuffix}.`);
+          }
           throw new Error(`${runtime.adapter?.displayName || 'Чат'}: нижняя позиция стабильна, но DOM-признак конца истории не подтвержден.`);
         }
 
@@ -778,7 +1058,7 @@
         'добираю историю вниз...',
       ));
 
-      const command = scroller.scrollDownOneStep(scrollContainer);
+      const command = scroller.scrollDownOneStep(scrollContainer, getScrollMode());
       const requestedStepPx = command.stepPx;
       log.write('SCROLL_DOWN', {
         ...passContext,
@@ -853,35 +1133,365 @@
     throw new Error(`Превышен лимит ${MAX_ITERATIONS} шагов при сборе истории.`);
   }
 
-  async function run() {
+  function configureNetworkPanel(totalPasses) {
+    runtime.panel?.configureFields?.({
+      assistant: true,
+      method: false,
+      messages: true,
+      pass: totalPasses > 1,
+      iteration: false,
+      position: false,
+    });
+  }
+
+  function updateNetworkPanel(state) {
+    if (!runtime.panel || !state) {
+      return;
+    }
+
+    runtime.panel.setPass(Math.max(1, state.pass || 1), Math.max(1, state.totalPasses || 1));
+
+    switch (state.phase) {
+      case 'attaching':
+        runtime.panel.setStatus('Подключаюсь...');
+        break;
+      case 'armed':
+        runtime.panel.setStatus('Перезагружаю страницу...');
+        break;
+      case 'capturing':
+        runtime.panel.setStatus('Получаю историю...');
+        break;
+      case 'waiting-next-pass':
+        runtime.panel.setStatus('Готовлю дополнительный проход...');
+        break;
+      case 'ready':
+        runtime.panel.setStatus('Проверяю данные...');
+        break;
+      case 'error':
+        runtime.panel.setStatus(`Ошибка: ${state.error || 'сетевой захват не завершен'}`);
+        break;
+      case 'cancelled':
+        runtime.panel.setStatus('Остановлено.');
+        break;
+      default:
+        runtime.panel.setStatus('Подготовка...');
+        break;
+    }
+  }
+
+  async function waitForNetworkCaptureState(initialState) {
+    let state = initialState;
+
+    for (;;) {
+      if (runtime.aborted) {
+        return null;
+      }
+
+      updateNetworkPanel(state);
+      if (!state || ['ready', 'error', 'cancelled', 'released'].includes(state.phase)) {
+        return state;
+      }
+
+      const completed = await sleep(350, runtime.abortController.signal);
+      if (!completed || runtime.aborted) {
+        return null;
+      }
+
+      const response = await sendCaptureMessage({
+        type: CAPTURE_GET_STATE_MESSAGE,
+        includeCaptures: false,
+      });
+      state = response.state;
+    }
+  }
+
+  async function runNetworkAdapter(currentSettings, detection) {
+    runtime.networkMode = true;
+    runtime.adapter = detection.adapter;
     runtime.stop = stopRuntime;
 
-    log.write('START', {
-      page: loggerModule.sanitizePageUrl(),
-      title: document.title,
-      version: app.version,
+    const configuredExtraPasses = currentSettings.extraPassesEnabled
+      ? settings.clampExtraPassCount(currentSettings.extraPassCount)
+      : 0;
+    const totalPasses = 1 + configuredExtraPasses;
+    const config = runtime.adapter.getNetworkCaptureConfig?.();
+    if (!config?.urlPattern || typeof runtime.adapter.parseNetworkCaptures !== 'function') {
+      throw new Error(`${runtime.adapter.displayName || runtime.adapter.id}: сетевой адаптер настроен неполно.`);
+    }
+
+    let stateResponse = await sendCaptureMessage({
+      type: CAPTURE_GET_STATE_MESSAGE,
+      includeCaptures: false,
     });
+    let state = stateResponse.state;
+
+    if (!state) {
+      runtime.panel = panelModule.createPanel({
+        startedAt: runtime.startedAt,
+        onStop: stopRuntime,
+      });
+      runtime.panel.setAssistant(runtime.adapter.displayName || runtime.adapter.id);
+      configureNetworkPanel(totalPasses);
+      runtime.panel.setMessageCount(0);
+      runtime.panel.setPass(1, totalPasses);
+      runtime.panel.setStatus('Подключаюсь...');
+
+      const startResponse = await sendCaptureMessage({
+        type: CAPTURE_START_MESSAGE,
+        adapterId: runtime.adapter.id,
+        adapterName: runtime.adapter.displayName || runtime.adapter.id,
+        adapterScore: detection.score,
+        urlPattern: config.urlPattern,
+        timeoutMs: config.timeoutMs || 60_000,
+        totalPasses,
+        minDelayMs: currentSettings.minDelayMs,
+        maxDelayMs: currentSettings.maxDelayMs,
+        version: app.version,
+        page: loggerModule.sanitizePageUrl(),
+        title: document.title,
+        settings: currentSettings,
+      });
+      state = startResponse.state;
+      if (state?.startedAt) {
+        runtime.startedAt = state.startedAt;
+        log.setStartedAt?.(state.startedAt);
+      }
+      updateNetworkPanel(state);
+
+      if (state?.phase === 'error') {
+        log.importEntries?.(state.events || []);
+        await sendCaptureMessage({ type: CAPTURE_RELEASE_MESSAGE }).catch(() => {});
+        throw new Error(state.error || 'Не удалось запустить сетевой захват.');
+      }
+
+      // Page.reload выполняется background-процессом. Текущий document будет уничтожен,
+      // а runtime автоматически внедрится снова после завершения навигации.
+      return true;
+    }
+
+    if (state.adapterId !== runtime.adapter.id) {
+      throw new Error(`Во вкладке уже активен сетевой захват адаптера ${state.adapterId}.`);
+    }
+
+    if (state.startedAt) {
+      runtime.startedAt = state.startedAt;
+      log.setStartedAt?.(state.startedAt);
+    }
 
     runtime.panel = panelModule.createPanel({
       startedAt: runtime.startedAt,
       onStop: stopRuntime,
     });
+    runtime.panel.setAssistant(runtime.adapter.displayName || runtime.adapter.id);
+    configureNetworkPanel(state.totalPasses || totalPasses);
+    runtime.panel.setMessageCount(0);
+    updateNetworkPanel(state);
 
+    state = await waitForNetworkCaptureState(state);
+    if (!state || runtime.aborted) {
+      return;
+    }
+
+    if (state.phase === 'cancelled') {
+      log.importEntries?.(state.events || []);
+      await log.saveOnce('CANCELLED');
+      return;
+    }
+
+    if (state.phase === 'error') {
+      log.importEntries?.(state.events || []);
+      const message = state.error || 'Сетевой захват завершился ошибкой.';
+      log.write('ERROR', { message });
+      runtime.panel.setStatus(`Ошибка: ${message}`);
+      runtime.panel.markError();
+      await log.saveOnce('ERROR');
+      await sendCaptureMessage({ type: CAPTURE_RELEASE_MESSAGE }).catch(() => {});
+      return;
+    }
+
+    stateResponse = await sendCaptureMessage({
+      type: CAPTURE_GET_STATE_MESSAGE,
+      includeCaptures: true,
+    });
+    state = stateResponse.state;
+    if (!state || state.phase !== 'ready' || !Array.isArray(state.captures)) {
+      throw new Error('Сетевой захват завершен без доступных данных ответа.');
+    }
+
+    // После получения тел сетевой debugger больше не нужен. Отключаем его до парсинга/сохранения.
+    let releaseState = null;
+    try {
+      const releaseResponse = await sendCaptureMessage({ type: CAPTURE_RELEASE_MESSAGE });
+      releaseState = releaseResponse.state || null;
+    } catch (error) {
+      log.write('DEBUGGER_RELEASE_FAILED', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    log.importEntries?.(releaseState?.events || state.events || []);
+
+    runtime.panel.setStatus('Разбираю JSON...');
+    const parsed = runtime.adapter.parseNetworkCaptures(state.captures);
+    const finalStats = parsed.stats;
+    const diagnostics = parsed.diagnostics || {};
+
+    for (const passStats of diagnostics.passStats || []) {
+      log.write('MESSAGE_BATCH', {
+        reason: 'network-pass',
+        pass: passStats.pass,
+        totalPasses: state.totalPasses,
+        extraPass: passStats.pass > 1,
+        received: passStats.received,
+        added: passStats.added,
+        updated: passStats.updated,
+        duplicates: passStats.duplicates,
+        malformed: passStats.malformed,
+        total: finalStats.total,
+        user: finalStats.user,
+        assistant: finalStats.assistant,
+        other: finalStats.other,
+      });
+    }
+
+    log.write('JSON_PARSED', {
+      adapter: runtime.adapter.id,
+      captures: state.captures.length,
+      responses: diagnostics.responses ?? null,
+      uniqueResponseIds: diagnostics.uniqueResponseIds ?? null,
+    });
+    log.write('GROK_CHAIN_STATUS', {
+      responses: diagnostics.responses ?? null,
+      uniqueResponseIds: diagnostics.uniqueResponseIds ?? null,
+      internalLinkCount: diagnostics.internalLinkCount ?? null,
+      externalRootParentId: diagnostics.externalRootParentId ?? null,
+      chainComplete: diagnostics.chainComplete === true,
+      control: diagnostics.control ?? 0,
+      partial: diagnostics.partial ?? 0,
+      unknownSender: diagnostics.unknownSender ?? 0,
+      empty: diagnostics.empty ?? 0,
+      attachmentMessages: diagnostics.attachmentMessages ?? 0,
+      attachmentCount: diagnostics.attachmentCount ?? 0,
+      timestampedMessages: diagnostics.timestampedMessages ?? 0,
+      missingTimestampMessages: diagnostics.missingTimestampMessages ?? 0,
+    });
+
+    if ((diagnostics.attachmentCount || 0) > 0) {
+      log.write('GROK_ATTACHMENT_DATA_PRESENT', {
+        messages: diagnostics.attachmentMessages,
+        attachments: diagnostics.attachmentCount,
+        note: 'attachment payload mapping is not yet validated in network adapter',
+      });
+    }
+
+    runtime.panel.setMessageCount(finalStats.total);
+    runtime.panel.stopTimer();
+    runtime.panel.setStatus('Формирую файл...');
+
+    const artifact = buildNetworkMarkdownArtifact(parsed.conversation);
+    const workDurationMs = Date.now() - runtime.startedAt;
+    const passAdditions = (diagnostics.passStats || []).map((item) => item.added);
+
+    log.write('EXPORT_READY', {
+      format: 'markdown',
+      filename: artifact.filename,
+      messages: finalStats.total,
+      passes: state.totalPasses,
+      extraPasses: Math.max(0, state.totalPasses - 1),
+      passAdditions,
+      acquisitionMode: 'network',
+      workDurationMs,
+      workDuration: loggerModule.formatDuration(workDurationMs),
+    });
+
+    if (currentSettings.autoSave) {
+      runtime.panel.setStatus('Сохраняю файл...');
+      await saveMarkdownArtifact(artifact, 'auto', { saveAs: false });
+      runtime.panel.setStatus('Сохранено.');
+      runtime.panel.setCloseTitle('Закрыть');
+      runtime.panel.markDone();
+
+      const durationMs = Date.now() - runtime.startedAt;
+      log.write('COMPLETED', {
+        reason: `${runtime.adapter.id}-network-markdown-export`,
+        messages: finalStats.total,
+        user: finalStats.user,
+        assistant: finalStats.assistant,
+        passes: state.totalPasses,
+        extraPasses: Math.max(0, state.totalPasses - 1),
+        passAdditions,
+        acquisitionMode: 'network',
+        workDurationMs,
+        workDuration: loggerModule.formatDuration(workDurationMs),
+        durationMs,
+        duration: loggerModule.formatDuration(durationMs),
+        filename: artifact.filename,
+      });
+      if (currentSettings.autoClosePanel) {
+        log.write('PANEL_AUTO_CLOSE', { reason: 'auto-save' });
+      }
+      await log.saveOnce('COMPLETED');
+      if (currentSettings.autoClosePanel) {
+        runtime.panel?.remove?.();
+      }
+      return;
+    }
+
+    runtime.panel.setStatus('Сбор завершен.');
+    runtime.panel.setCloseTitle('Закрыть');
+    runtime.panel.markDone();
+    log.write('WAITING_FOR_SAVE_DECISION', {
+      messages: finalStats.total,
+      passes: state.totalPasses,
+      filename: artifact.filename,
+    });
+
+    const action = await waitForManualExportAction(artifact, finalStats);
+    if (runtime.aborted || action.state === 'aborted') {
+      return;
+    }
+
+    if (action.state === 'cancelled') {
+      log.write('COMPLETED', {
+        reason: 'markdown-save-cancelled',
+        messages: finalStats.total,
+        passes: state.totalPasses,
+        workDurationMs,
+        workDuration: loggerModule.formatDuration(workDurationMs),
+      });
+      await log.saveOnce('CANCELLED');
+      return;
+    }
+
+    const durationMs = Date.now() - runtime.startedAt;
+    log.write('COMPLETED', {
+      reason: `${runtime.adapter.id}-network-markdown-export-manual`,
+      messages: finalStats.total,
+      user: finalStats.user,
+      assistant: finalStats.assistant,
+      passes: state.totalPasses,
+      extraPasses: Math.max(0, state.totalPasses - 1),
+      passAdditions,
+      acquisitionMode: 'network',
+      workDurationMs,
+      workDuration: loggerModule.formatDuration(workDurationMs),
+      durationMs,
+      duration: loggerModule.formatDuration(durationMs),
+      filename: artifact.filename,
+    });
+    if (currentSettings.autoClosePanel) {
+      log.write('PANEL_AUTO_CLOSE', { reason: 'manual-save' });
+    }
+    await log.saveOnce('COMPLETED');
+    if (currentSettings.autoClosePanel) {
+      runtime.panel?.remove?.();
+    }
+  }
+
+  async function run() {
+    runtime.stop = stopRuntime;
     runtime.settingsPromise = settings.loadSettings();
     const currentSettings = await resolveSettings();
-    const configuredExtraPasses = currentSettings.extraPassesEnabled
-      ? settings.clampExtraPassCount(currentSettings.extraPassCount)
-      : 0;
-
-    log.write('SETTINGS', {
-      autoSave: currentSettings.autoSave,
-      saveLog: currentSettings.saveLog,
-      autoClosePanel: currentSettings.autoClosePanel,
-      extraPassesEnabled: currentSettings.extraPassesEnabled,
-      extraPassCount: currentSettings.extraPassCount,
-      minDelayMs: currentSettings.minDelayMs,
-      maxDelayMs: currentSettings.maxDelayMs,
-    });
 
     if (runtime.aborted) {
       await log.saveOnce('CANCELLED');
@@ -895,12 +1505,59 @@
       throw new Error('Не удалось определить адаптер страницы.');
     }
 
+    if (runtime.adapter.acquisitionMode === 'network') {
+      try {
+        const capturePending = await runNetworkAdapter(currentSettings, detection);
+        if (!capturePending) {
+          runtime.running = false;
+        }
+      } catch (error) {
+        console.warn('Chat Context Exporter: ошибка сетевого адаптера.', error);
+        const message = error instanceof Error ? error.message : String(error);
+        log.write('ERROR', { message });
+        runtime.panel?.setStatus(`Ошибка: ${message}`);
+        runtime.panel?.markError();
+        runtime.running = false;
+        await log.saveOnce('ERROR');
+      }
+      return;
+    }
+
+    const configuredExtraPasses = currentSettings.extraPassesEnabled
+      ? settings.clampExtraPassCount(currentSettings.extraPassCount)
+      : 0;
+
+    log.write('START', {
+      page: loggerModule.sanitizePageUrl(),
+      title: document.title,
+      version: app.version,
+    });
+
+    runtime.panel = panelModule.createPanel({
+      startedAt: runtime.startedAt,
+      onStop: stopRuntime,
+    });
+    runtime.panel.setMethod('DOM');
+
+    log.write('SETTINGS', {
+      autoSave: currentSettings.autoSave,
+      saveLog: currentSettings.saveLog,
+      autoClosePanel: currentSettings.autoClosePanel,
+      extraPassesEnabled: currentSettings.extraPassesEnabled,
+      extraPassCount: currentSettings.extraPassCount,
+      minDelayMs: currentSettings.minDelayMs,
+      maxDelayMs: currentSettings.maxDelayMs,
+    });
+
     runtime.panel.setAssistant(runtime.adapter.displayName || runtime.adapter.id);
     log.write('ADAPTER_SELECTED', {
       id: runtime.adapter.id,
       name: runtime.adapter.displayName,
       score: detection.score,
       supportsMessageCollection: Boolean(runtime.adapter.supportsMessageCollection),
+      acquisitionMode: 'dom',
+      variant: runtime.adapter.variant || null,
+      scrollMode: getScrollMode(),
     });
 
     let scrollContainer = runtime.adapter.findScroller?.();
@@ -999,6 +1656,14 @@
           seekDurationMs: seekResult.durationMs,
           collectDurationMs: collectResult.durationMs,
           durationMs: passDurationMs,
+          collectionComplete: collectResult.collectionComplete !== false,
+          expectedTurnCount: collectResult.expectedTurnCount ?? null,
+          observedTurnCount: collectResult.observedTurnCount ?? null,
+          resolvedTurnCount: collectResult.resolvedTurnCount ?? null,
+          missingTurnCount: collectResult.missingTurnCount ?? null,
+          unresolvedTurnCount: collectResult.unresolvedTurnCount ?? null,
+          fallbackMessageTurnCount: collectResult.fallbackMessageTurnCount ?? null,
+          transientTurnCount: collectResult.transientTurnCount ?? null,
         };
         passResults.push(passResult);
 
@@ -1009,6 +1674,14 @@
           added: addedThisPass,
           updatedDuringSeek: seekResult.updatedDuringPhase,
           updatedDuringCollect: collectResult.updatedDuringPhase,
+          collectionComplete: collectResult.collectionComplete !== false,
+          expectedTurnCount: collectResult.expectedTurnCount ?? null,
+          observedTurnCount: collectResult.observedTurnCount ?? null,
+          resolvedTurnCount: collectResult.resolvedTurnCount ?? null,
+          missingTurnCount: collectResult.missingTurnCount ?? null,
+          unresolvedTurnCount: collectResult.unresolvedTurnCount ?? null,
+          fallbackMessageTurnCount: collectResult.fallbackMessageTurnCount ?? null,
+          transientTurnCount: collectResult.transientTurnCount ?? null,
           durationMs: passDurationMs,
           duration: loggerModule.formatDuration(passDurationMs),
         });
@@ -1036,7 +1709,7 @@
       if (currentSettings.autoSave) {
         runtime.panel.setStatus('Сохраняю файл...');
         await saveMarkdownArtifact(artifact, 'auto', { saveAs: false });
-        runtime.panel.setStatus(`Сохранено: ${finalStats.total} сообщений.`);
+        runtime.panel.setStatus('Сохранено.');
         runtime.panel.setCloseTitle('Закрыть');
         runtime.panel.markDone();
 
@@ -1067,7 +1740,7 @@
         return;
       }
 
-      runtime.panel.setStatus(`Сбор завершен: ${finalStats.total} сообщений.`);
+      runtime.panel.setStatus('Сбор завершен.');
       runtime.panel.setCloseTitle('Закрыть');
       runtime.panel.markDone();
       log.write('WAITING_FOR_SAVE_DECISION', {
@@ -1118,7 +1791,7 @@
         runtime.panel?.remove?.();
       }
     } catch (error) {
-      console.error('Chat Context Exporter: ошибка выполнения.', error);
+      console.warn('Chat Context Exporter: ошибка выполнения.', error);
       const message = error instanceof Error ? error.message : String(error);
       log.write('ERROR', { message });
       runtime.panel?.setStatus(`Ошибка: ${message}`);
@@ -1128,6 +1801,14 @@
       runtime.running = false;
     }
   }
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (!message || message.type !== CAPTURE_STATUS_MESSAGE || !runtime.networkMode) {
+      return false;
+    }
+    updateNetworkPanel(message.state || null);
+    return false;
+  });
 
   run().catch((error) => {
     console.error('Chat Context Exporter: необработанная ошибка.', error);

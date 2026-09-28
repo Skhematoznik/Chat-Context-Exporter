@@ -118,6 +118,10 @@
       return [];
     }
 
+    if (node.matches('[data-cce-math-inline]')) {
+      return [{ type: 'math', value: normalizeText(node.textContent).trim() }];
+    }
+
     const children = () => parseInlineChildren(node, context);
 
     switch (node.tagName) {
@@ -249,6 +253,11 @@
 
     if (isExplicitlyHidden(node)) {
       return [];
+    }
+
+    if (node.matches('[data-cce-math-block]')) {
+      const value = normalizeText(node.textContent).trim();
+      return value ? [{ type: 'mathBlock', value }] : [];
     }
 
     if (isCodeBlockWrapper(node)) {

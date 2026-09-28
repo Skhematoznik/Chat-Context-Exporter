@@ -145,9 +145,27 @@
     return immediateTop;
   }
 
-  function scrollToDirect(element, targetTop) {
-    const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
-    const safeTarget = Math.min(maxTop, Math.max(0, Number(targetTop) || 0));
+  function normalizeScrollMode(mode) {
+    return mode === 'reverse' ? 'reverse' : 'normal';
+  }
+
+  function getScrollBounds(element, mode = 'normal') {
+    const range = Math.max(0, element.scrollHeight - element.clientHeight);
+    if (normalizeScrollMode(mode) === 'reverse') {
+      return { min: -range, max: 0, start: -range, end: 0, range };
+    }
+    return { min: 0, max: range, start: 0, end: range, range };
+  }
+
+  function clampScrollTop(element, targetTop, mode = 'normal') {
+    const bounds = getScrollBounds(element, mode);
+    const requested = Number(targetTop);
+    const finiteTarget = Number.isFinite(requested) ? requested : 0;
+    return Math.min(bounds.max, Math.max(bounds.min, finiteTarget));
+  }
+
+  function scrollToDirect(element, targetTop, mode = 'normal') {
+    const safeTarget = clampScrollTop(element, targetTop, mode);
     const from = element.scrollTop;
     const immediate = applyDirectScrollTop(element, safeTarget);
 
@@ -159,12 +177,12 @@
     };
   }
 
-  function scrollUpOneStep(element) {
+  function scrollUpOneStep(element, mode = 'normal') {
     const stepPx = getStepPx(element);
     const from = element.scrollTop;
-    const target = Math.max(0, from - stepPx);
-    const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
-    const atBottom = Math.abs(from - maxTop) <= 2;
+    const bounds = getScrollBounds(element, mode);
+    const target = Math.max(bounds.min, from - stepPx);
+    const atBottom = Math.abs(from - bounds.end) <= 2;
 
     // Некоторые виртуализированные чаты удерживают список в режиме
     // «приклеен к последнему сообщению». При старте ровно с нижней границы smooth-scroll
@@ -197,11 +215,11 @@
     };
   }
 
-  function scrollDownOneStep(element) {
+  function scrollDownOneStep(element, mode = 'normal') {
     const stepPx = getStepPx(element);
     const from = element.scrollTop;
-    const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
-    const target = Math.min(maxTop, from + stepPx);
+    const bounds = getScrollBounds(element, mode);
+    const target = Math.min(bounds.max, from + stepPx);
 
     element.scrollBy({
       top: stepPx,
@@ -218,13 +236,14 @@
     };
   }
 
-  function isAtTop(element, epsilonPx = 2) {
-    return element.scrollTop <= epsilonPx;
+  function isAtTop(element, epsilonPx = 2, mode = 'normal') {
+    const bounds = getScrollBounds(element, mode);
+    return Math.abs(element.scrollTop - bounds.start) <= epsilonPx;
   }
 
-  function isAtBottom(element, epsilonPx = 2) {
-    const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
-    return Math.abs(element.scrollTop - maxTop) <= epsilonPx;
+  function isAtBottom(element, epsilonPx = 2, mode = 'normal') {
+    const bounds = getScrollBounds(element, mode);
+    return Math.abs(element.scrollTop - bounds.end) <= epsilonPx;
   }
 
   function cancelCurrentScroll(element) {
@@ -253,6 +272,7 @@
     cancelCurrentScroll,
     describeElement,
     findGenericScrollContainer,
+    getScrollBounds,
     getStepPx,
     isScrollableElement,
     isAtBottom,

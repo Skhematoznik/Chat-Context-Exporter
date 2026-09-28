@@ -103,7 +103,8 @@
           align-items: center;
           gap: 10px;
           padding: 10px 12px;
-          background: linear-gradient(135deg, #d6008f, #ff2bb6);
+          background: #202228;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.08);
           cursor: grab;
           user-select: none;
           touch-action: none;
@@ -117,13 +118,13 @@
           width: 28px;
           height: 28px;
           border-radius: 7px;
-          background: rgba(0, 0, 0, 0.16);
+          background: rgba(255, 255, 255, 0.06);
           color: #fff;
           font-size: 20px;
           line-height: 1;
           cursor: pointer;
         }
-        .close:hover { background: rgba(0, 0, 0, 0.28); }
+        .close:hover { background: rgba(255, 255, 255, 0.12); }
         .body { padding: 12px; }
         .timer {
           margin: 0 0 8px;
@@ -139,6 +140,8 @@
           font-size: 12px;
           color: #cfcfd5;
         }
+        .meta-row { display: contents; }
+        .meta-row[hidden] { display: none; }
         .value { color: #fff; overflow-wrap: anywhere; }
         .actions {
           display: flex;
@@ -161,9 +164,9 @@
         .action-button:hover { background: rgba(255, 255, 255, 0.14); }
         .action-button.primary {
           border-color: transparent;
-          background: #e6009c;
+          background: #343840;
         }
-        .action-button.primary:hover { background: #ff18b0; }
+        .action-button.primary:hover { background: #434852; }
         .action-button:disabled { opacity: 0.55; cursor: default; }
         .progress {
           height: 4px;
@@ -175,7 +178,7 @@
         .progress > div {
           width: 35%;
           height: 100%;
-          background: #ff2bb6;
+          background: #aeb4bf;
           animation: travel 1.2s ease-in-out infinite alternate;
         }
         .progress.done > div { width: 100%; animation: none; }
@@ -199,11 +202,12 @@
           <div class="timer">Время: <span class="elapsed">00:00:00</span></div>
           <p class="status">Подготовка...</p>
           <div class="meta">
-            <span>Чат:</span><span class="value assistant">определение</span>
-            <span>Сообщений:</span><span class="value messages">0</span>
-            <span>Проход:</span><span class="value pass">1 / 1</span>
-            <span>Шаг:</span><span class="value iteration">0</span>
-            <span>Позиция:</span><span class="value position">—</span>
+            <div class="meta-row" data-meta-field="assistant"><span>Чат:</span><span class="value assistant">определение</span></div>
+            <div class="meta-row" data-meta-field="method"><span>Метод:</span><span class="value method">определение</span></div>
+            <div class="meta-row" data-meta-field="messages"><span>Сообщений:</span><span class="value messages">0</span></div>
+            <div class="meta-row" data-meta-field="pass"><span>Проход:</span><span class="value pass">1 / 1</span></div>
+            <div class="meta-row" data-meta-field="iteration"><span>Шаг:</span><span class="value iteration">0</span></div>
+            <div class="meta-row" data-meta-field="position"><span>Позиция:</span><span class="value position">—</span></div>
           </div>
           <div class="actions" hidden>
             <button class="action-button primary save" type="button">Сохранить</button>
@@ -221,10 +225,14 @@
     const elapsed = shadow.querySelector('.elapsed');
     const status = shadow.querySelector('.status');
     const assistant = shadow.querySelector('.assistant');
+    const method = shadow.querySelector('.method');
     const messages = shadow.querySelector('.messages');
     const pass = shadow.querySelector('.pass');
     const iteration = shadow.querySelector('.iteration');
     const position = shadow.querySelector('.position');
+    const metaRows = new Map(
+      [...shadow.querySelectorAll('[data-meta-field]')].map((row) => [row.dataset.metaField, row]),
+    );
     const progress = shadow.querySelector('.progress');
     const actions = shadow.querySelector('.actions');
     const saveButton = shadow.querySelector('.save');
@@ -284,6 +292,21 @@
       },
       setStatus(text) { status.textContent = text; },
       setAssistant(text) { assistant.textContent = text; },
+      setMethod(text) { method.textContent = text; },
+      setFieldVisible(field, visible) {
+        const row = metaRows.get(field);
+        if (row) {
+          row.hidden = !visible;
+        }
+      },
+      configureFields(fields = {}) {
+        for (const [field, visible] of Object.entries(fields)) {
+          const row = metaRows.get(field);
+          if (row) {
+            row.hidden = !visible;
+          }
+        }
+      },
       setMessageCount(value) { messages.textContent = String(value); },
       setPass(current, total) { pass.textContent = `${current} / ${total}`; },
       setIteration(value) { iteration.textContent = String(value); },

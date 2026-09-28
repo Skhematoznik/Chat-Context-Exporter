@@ -56,19 +56,26 @@
         const stableId = adapter.getMessageId?.(element)
           || createFallbackId({ role, orderKey, contentRoot });
         const timestamp = adapter.getMessageTimestamp?.(element) || null;
+        const qualityCandidate = Number(adapter.getMessageQualityRank?.(element));
+        const qualityRank = Number.isFinite(qualityCandidate) ? qualityCandidate : 0;
         const html = contentRoot.innerHTML;
         const textLength = (contentRoot.textContent || '').length;
         const existing = records.get(stableId);
 
         if (existing) {
-          const shouldRefresh = textLength > existing.textLength
-            || (textLength === existing.textLength && html.length > existing.html.length);
+          const existingQualityRank = Number.isFinite(existing.qualityRank) ? existing.qualityRank : 0;
+          const shouldRefresh = qualityRank > existingQualityRank
+            || (qualityRank === existingQualityRank && (
+              textLength > existing.textLength
+              || (textLength === existing.textLength && html.length > existing.html.length)
+            ));
           if (shouldRefresh) {
             records.set(stableId, {
               ...existing,
               role,
               timestamp,
               orderKey: orderKey ?? existing.orderKey,
+              qualityRank,
               html,
               textLength,
             });
@@ -83,6 +90,7 @@
           timestamp,
           orderKey,
           discoveryIndex,
+          qualityRank,
           html,
           textLength,
         });

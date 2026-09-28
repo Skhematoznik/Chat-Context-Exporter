@@ -72,9 +72,12 @@
 
   function createLogger({ getSettings, startedAt }) {
     const lines = [];
+    let startTimestamp = Number(startedAt) || Date.now();
     let savePromise = null;
+    let saved = false;
+    let finalWritten = false;
 
-    function write(event, details = null) {
+    function writeAt(timestamp, event, details = null) {
       const suffix = details && typeof details === 'object'
         ? Object.entries(details)
           .map(([key, value]) => `${key}=${stringifyLogValue(value)}`)
@@ -83,12 +86,42 @@
           ? ''
           : stringifyLogValue(details);
 
+      const date = timestamp instanceof Date
+        ? timestamp
+        : new Date(Number(timestamp) || Date.now());
       lines.push(
-        `[${formatLocalTimestamp()}] ${event}${suffix ? ` | ${suffix}` : ''}`,
+        `[${formatLocalTimestamp(date)}] ${event}${suffix ? ` | ${suffix}` : ''}`,
       );
     }
 
+    function write(event, details = null) {
+      writeAt(Date.now(), event, details);
+    }
+
+    function importEntries(entries) {
+      for (const entry of entries || []) {
+        if (!entry || typeof entry.event !== 'string') {
+          continue;
+        }
+        writeAt(entry.timestampMs, entry.event, entry.details ?? null);
+      }
+    }
+
+    function buildLogContent() {
+      const header = [
+        'Chat Context Exporter',
+        'Technical log',
+        `Page: ${sanitizePageUrl()}`,
+        `Generated: ${formatLocalTimestamp()}`,
+        '',
+      ];
+      return `${header.join('\r\n')}${lines.join('\r\n')}\r\n`;
+    }
+
     async function saveOnce(finalState) {
+      if (saved) {
+        return { ok: true, alreadySaved: true };
+      }
       if (savePromise) {
         return savePromise;
       }
@@ -96,41 +129,50 @@
       savePromise = (async () => {
         const settings = await getSettings();
         if (!settings.saveLog) {
-          return;
+          return { ok: true, skipped: true };
         }
 
-        const durationMs = Date.now() - startedAt;
-        write('FINAL', {
-          state: finalState,
-          durationMs,
-          duration: formatDuration(durationMs),
-        });
+        if (!finalWritten) {
+          const durationMs = Date.now() - startTimestamp;
+          write('FINAL', {
+            state: finalState,
+            durationMs,
+            duration: formatDuration(durationMs),
+          });
+          finalWritten = true;
+        }
 
-        const header = [
-          'Chat Context Exporter',
-          'Technical log',
-          `Page: ${sanitizePageUrl()}`,
-          `Generated: ${formatLocalTimestamp()}`,
-          '',
-        ];
-
-        const content = `${header.join('\r\n')}${lines.join('\r\n')}\r\n`;
         const filename = `Chat-Context-Exporter_${formatFilenameTimestamp()}.txt`;
+        write('LOG_SAVE_REQUESTED', { filename });
 
         try {
-          const response = await chrome.runtime.sendMessage({
-            type: SAVE_FILE_MESSAGE,
+          const saver = app.modules.fileSaver;
+          if (!saver?.saveTextFile) {
+            throw new Error('Модуль сохранения файлов недоступен.');
+          }
+
+          const response = await saver.saveTextFile({
             filename,
-            content,
+            content: buildLogContent(),
             mimeType: 'text/plain',
             saveAs: false,
           });
 
-          if (!response?.ok) {
-            throw new Error(response?.error || 'Service worker отклонил сохранение лога.');
-          }
+          saved = true;
+          return {
+            ok: true,
+            downloadId: response.downloadId,
+            attempt: response.attempt,
+          };
         } catch (error) {
-          console.error('Chat Context Exporter: не удалось сохранить лог.', error);
+          const message = error instanceof Error ? error.message : String(error);
+          write('LOG_SAVE_FAILED', { filename, message });
+          console.warn('Chat Context Exporter: не удалось сохранить лог.', error);
+          return { ok: false, error: message };
+        } finally {
+          if (!saved) {
+            savePromise = null;
+          }
         }
       })();
 
@@ -139,6 +181,14 @@
 
     return {
       write,
+      writeAt,
+      importEntries,
+      setStartedAt(value) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          startTimestamp = parsed;
+        }
+      },
       saveOnce,
       formatDuration,
     };
