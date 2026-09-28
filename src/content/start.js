@@ -82,6 +82,13 @@
   const CAPTURE_CANCEL_MESSAGE = 'chat-context-exporter:capture:cancel';
   const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
   const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
+  const PAGE_INDEXEDDB_GET_MESSAGE = 'chat-context-exporter:indexeddb:get';
+  const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
+  const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
+  const LOCAL_CACHE_SYNC_RELEASE_MESSAGE = 'chat-context-exporter:local-cache-sync:release';
+  const LOCAL_CACHE_POST_RELOAD_MIN_WAIT_MS = 1500;
+  const LOCAL_CACHE_STABILITY_INTERVAL_MS = 350;
+  const LOCAL_CACHE_STABILITY_MATCHES = 2;
 
   async function resolveSettings() {
     if (runtime.settings) {
@@ -351,6 +358,14 @@
     return response;
   }
 
+  async function sendLocalCacheSyncMessage(message) {
+    const response = await chrome.runtime.sendMessage(message);
+    if (!response?.ok) {
+      throw new Error(response?.error || 'Ошибка канала локальной синхронизации.');
+    }
+    return response;
+  }
+
   async function saveMarkdownArtifact(artifact, reason, { saveAs = false } = {}) {
     log.write('MARKDOWN_SAVE_REQUESTED', {
       reason,
@@ -423,10 +438,7 @@
             return;
           }
           log.write('MARKDOWN_SAVE_CANCELLED', { reason: 'manual' });
-          runtime.panel.hideActions();
-          runtime.panel.setStatus('Сохранение отменено.');
-          runtime.panel.setCloseTitle('Закрыть');
-          runtime.panel.markDone();
+          runtime.panel.remove();
           finish({ state: 'cancelled' });
         },
       });
@@ -1206,6 +1218,496 @@
     }
   }
 
+  async function sendIndexedDbGet(config) {
+    const response = await chrome.runtime.sendMessage({
+      type: PAGE_INDEXEDDB_GET_MESSAGE,
+      databaseName: config.databaseName,
+      storeName: config.storeName,
+      key: config.key,
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || 'Не удалось прочитать IndexedDB страницы.');
+    }
+    return response.result;
+  }
+
+  function fingerprintLocalCacheRecord(record) {
+    const json = JSON.stringify(record);
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < json.length; index += 1) {
+      hash ^= json.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+
+    return {
+      signature: `${json.length}:${hash >>> 0}`,
+      recordBytes: new TextEncoder().encode(json).byteLength,
+    };
+  }
+
+  async function readLocalCacheRecordWithRetry(
+    config,
+    passContext,
+    { requireStable = false, minReadyAt = 0 } = {},
+  ) {
+    const timeoutMs = requireStable ? 8_000 : 5_000;
+    const deadline = Date.now() + timeoutMs;
+    let attempt = 0;
+    let stableSignature = null;
+    let stableMatches = 0;
+
+    if (requireStable && minReadyAt > Date.now()) {
+      const waitMs = minReadyAt - Date.now();
+      runtime.panel?.setStatus(formatPassStatus(
+        passContext,
+        'Жду синхронизацию DeepSeek...',
+        'жду синхронизацию DeepSeek...',
+      ));
+      log.write('LOCAL_CACHE_SYNC_WAIT', {
+        ...passContext,
+        reason: 'post-reload-grace-period',
+        delayMs: waitMs,
+      });
+      const completed = await sleep(waitMs, runtime.abortController.signal);
+      if (!completed || runtime.aborted) {
+        return null;
+      }
+    }
+
+    for (;;) {
+      if (runtime.aborted) {
+        return null;
+      }
+
+      attempt += 1;
+      log.write('LOCAL_CACHE_READ_STARTED', {
+        ...passContext,
+        attempt,
+        databaseName: config.databaseName,
+        storeName: config.storeName,
+        key: config.key,
+        requireStable,
+      });
+
+      const result = await sendIndexedDbGet(config);
+      if (result?.found) {
+        let fingerprint = { signature: null, recordBytes: null };
+        try {
+          fingerprint = fingerprintLocalCacheRecord(result.record);
+        } catch {}
+
+        log.write('LOCAL_CACHE_RECORD_READ', {
+          ...passContext,
+          attempt,
+          databaseName: config.databaseName,
+          storeName: config.storeName,
+          databaseVersion: result.databaseVersion ?? null,
+          recordBytes: fingerprint.recordBytes,
+        });
+
+        if (!requireStable) {
+          return result;
+        }
+
+        if (fingerprint.signature && fingerprint.signature === stableSignature) {
+          stableMatches += 1;
+        } else {
+          stableSignature = fingerprint.signature;
+          stableMatches = 1;
+        }
+
+        log.write('LOCAL_CACHE_STABILITY_CHECK', {
+          ...passContext,
+          attempt,
+          stableMatches,
+          requiredMatches: LOCAL_CACHE_STABILITY_MATCHES,
+          recordBytes: fingerprint.recordBytes,
+        });
+
+        if (stableMatches >= LOCAL_CACHE_STABILITY_MATCHES) {
+          log.write('LOCAL_CACHE_STABLE', {
+            ...passContext,
+            attempts: attempt,
+            stableMatches,
+            recordBytes: fingerprint.recordBytes,
+          });
+          return result;
+        }
+      } else {
+        stableSignature = null;
+        stableMatches = 0;
+        const reason = result?.reason || 'record-missing';
+        log.write('LOCAL_CACHE_READ_MISS', {
+          ...passContext,
+          attempt,
+          databaseName: config.databaseName,
+          storeName: config.storeName,
+          reason,
+          databaseVersion: result?.databaseVersion ?? null,
+        });
+      }
+
+      if (Date.now() >= deadline) {
+        if (requireStable) {
+          throw new Error(`${runtime.adapter?.displayName || 'Чат'}: локальная история не стабилизировалась после перезагрузки страницы.`);
+        }
+        const reason = result?.reason || 'record-missing';
+        throw new Error(`${runtime.adapter?.displayName || 'Чат'}: локальная история не найдена (${reason}). Дождитесь полной загрузки чата и повторите экспорт.`);
+      }
+
+      runtime.panel?.setStatus(formatPassStatus(
+        passContext,
+        requireStable ? 'Проверяю обновление локальной истории...' : 'Жду локальную историю...',
+        requireStable ? 'проверяю обновление локальной истории...' : 'жду локальную историю...',
+      ));
+      const completed = await sleep(
+        requireStable ? LOCAL_CACHE_STABILITY_INTERVAL_MS : 250,
+        runtime.abortController.signal,
+      );
+      if (!completed || runtime.aborted) {
+        return null;
+      }
+    }
+  }
+
+  async function runLocalCacheAdapter(currentSettings, detection) {
+    runtime.adapter = detection.adapter;
+    runtime.stop = stopRuntime;
+
+    const configuredExtraPasses = currentSettings.extraPassesEnabled
+      ? settings.clampExtraPassCount(currentSettings.extraPassCount)
+      : 0;
+    const totalPasses = 1 + configuredExtraPasses;
+    const config = runtime.adapter.getLocalCacheConfig?.();
+    if (
+      !config?.databaseName
+      || !config?.storeName
+      || config.key === undefined
+      || typeof runtime.adapter.parseLocalCacheReads !== 'function'
+    ) {
+      throw new Error(`${runtime.adapter.displayName || runtime.adapter.id}: локальный адаптер настроен неполно.`);
+    }
+
+    let syncState = null;
+    if (runtime.adapter.reloadBeforeLocalCacheRead === true) {
+      const stateResponse = await sendLocalCacheSyncMessage({
+        type: LOCAL_CACHE_SYNC_GET_STATE_MESSAGE,
+      });
+      syncState = stateResponse.state;
+
+      if (!syncState) {
+        runtime.panel = panelModule.createPanel({
+          startedAt: runtime.startedAt,
+          onStop: stopRuntime,
+        });
+        runtime.panel.setAssistant(runtime.adapter.displayName || runtime.adapter.id);
+        configureNetworkPanel(totalPasses);
+        runtime.panel.setMessageCount(0);
+        runtime.panel.setPass(1, totalPasses);
+        runtime.panel.setStatus('Перезагружаю страницу...');
+
+        const startResponse = await sendLocalCacheSyncMessage({
+          type: LOCAL_CACHE_SYNC_START_MESSAGE,
+          adapterId: runtime.adapter.id,
+          sessionId: config.sessionId || null,
+          version: app.version,
+          page: loggerModule.sanitizePageUrl(),
+          title: document.title,
+        });
+        syncState = startResponse.state;
+        if (syncState?.startedAt) {
+          runtime.startedAt = syncState.startedAt;
+          log.setStartedAt?.(syncState.startedAt);
+        }
+
+        // Background перезагрузит текущую вкладку. После завершения навигации
+        // runtime будет автоматически внедрен снова и продолжит этот запуск.
+        return true;
+      }
+
+      if (syncState.adapterId && syncState.adapterId !== runtime.adapter.id) {
+        throw new Error(`Во вкладке уже активна локальная синхронизация адаптера ${syncState.adapterId}.`);
+      }
+
+      if (syncState.startedAt) {
+        runtime.startedAt = syncState.startedAt;
+        log.setStartedAt?.(syncState.startedAt);
+      }
+
+      if (syncState.phase === 'error') {
+        await sendLocalCacheSyncMessage({ type: LOCAL_CACHE_SYNC_RELEASE_MESSAGE }).catch(() => {});
+        throw new Error(syncState.error || 'Не удалось перезагрузить страницу для синхронизации DeepSeek.');
+      }
+
+      if (syncState.phase !== 'ready') {
+        runtime.panel = panelModule.createPanel({
+          startedAt: runtime.startedAt,
+          onStop: stopRuntime,
+        });
+        runtime.panel.setAssistant(runtime.adapter.displayName || runtime.adapter.id);
+        configureNetworkPanel(totalPasses);
+        runtime.panel.setMessageCount(0);
+        runtime.panel.setPass(1, totalPasses);
+        runtime.panel.setStatus('Перезагружаю страницу...');
+        return true;
+      }
+    }
+
+    log.write('START', {
+      page: loggerModule.sanitizePageUrl(),
+      title: document.title,
+      version: app.version,
+    });
+    log.write('SETTINGS', {
+      autoSave: currentSettings.autoSave,
+      saveLog: currentSettings.saveLog,
+      autoClosePanel: currentSettings.autoClosePanel,
+      extraPassesEnabled: currentSettings.extraPassesEnabled,
+      extraPassCount: currentSettings.extraPassCount,
+      minDelayMs: currentSettings.minDelayMs,
+      maxDelayMs: currentSettings.maxDelayMs,
+    });
+    log.write('ADAPTER_SELECTED', {
+      id: runtime.adapter.id,
+      name: runtime.adapter.displayName,
+      score: detection.score,
+      acquisitionMode: 'local-cache',
+      reloadBeforeRead: runtime.adapter.reloadBeforeLocalCacheRead === true,
+    });
+    log.write('LOCAL_CACHE_SELECTED', {
+      databaseName: config.databaseName,
+      storeName: config.storeName,
+      key: config.key,
+      sessionId: config.sessionId || null,
+      access: 'read-only',
+    });
+
+    if (syncState) {
+      log.write('PAGE_RELOAD_REQUESTED', {
+        reason: 'local-cache-sync',
+        requestedAt: syncState.reloadRequestedAt ?? null,
+      });
+      log.write('PAGE_RELOAD_COMPLETED', {
+        reason: 'local-cache-sync',
+        completedAt: syncState.reloadCompletedAt ?? null,
+        reloadDurationMs: syncState.reloadRequestedAt && syncState.reloadCompletedAt
+          ? syncState.reloadCompletedAt - syncState.reloadRequestedAt
+          : null,
+      });
+      log.write('LOCAL_CACHE_SYNC_READY', {
+        sessionId: config.sessionId || null,
+        reloadCompletedAt: syncState.reloadCompletedAt ?? null,
+      });
+      await sendLocalCacheSyncMessage({ type: LOCAL_CACHE_SYNC_RELEASE_MESSAGE }).catch(() => {});
+    }
+
+    runtime.panel = panelModule.createPanel({
+      startedAt: runtime.startedAt,
+      onStop: stopRuntime,
+    });
+    runtime.panel.setAssistant(runtime.adapter.displayName || runtime.adapter.id);
+    configureNetworkPanel(totalPasses);
+    runtime.panel.setMessageCount(0);
+    runtime.panel.setPass(1, totalPasses);
+    runtime.panel.setStatus(syncState ? 'Жду синхронизацию DeepSeek...' : 'Читаю локальную историю...');
+
+    const reads = [];
+    for (let pass = 1; pass <= totalPasses; pass += 1) {
+      if (runtime.aborted) {
+        return false;
+      }
+
+      const passContext = {
+        pass,
+        totalPasses,
+        extraPass: pass > 1,
+      };
+      runtime.panel.setPass(pass, totalPasses);
+      runtime.panel.setStatus(formatPassStatus(
+        passContext,
+        pass === 1 && syncState ? 'Проверяю обновление локальной истории...' : 'Читаю локальную историю...',
+        pass === 1 && syncState ? 'проверяю обновление локальной истории...' : 'читаю локальную историю...',
+      ));
+      log.write('PASS_STARTED', {
+        ...passContext,
+        acquisitionMode: 'local-cache',
+        readsBefore: reads.length,
+      });
+
+      const result = await readLocalCacheRecordWithRetry(config, passContext, {
+        requireStable: pass === 1 && Boolean(syncState),
+        minReadyAt: pass === 1 && syncState?.reloadCompletedAt
+          ? syncState.reloadCompletedAt + LOCAL_CACHE_POST_RELOAD_MIN_WAIT_MS
+          : 0,
+      });
+      if (!result || runtime.aborted) {
+        return false;
+      }
+      reads.push({
+        pass,
+        databaseVersion: result.databaseVersion ?? null,
+        record: result.record,
+      });
+
+      log.write('PASS_COMPLETED', {
+        ...passContext,
+        acquisitionMode: 'local-cache',
+        readsAfter: reads.length,
+      });
+
+      if (pass < totalPasses) {
+        runtime.panel.setStatus('Готовлю дополнительный проход...');
+        const completed = await waitConfiguredDelay(currentSettings, 'between-local-cache-passes');
+        if (!completed || runtime.aborted) {
+          return false;
+        }
+      }
+    }
+
+    runtime.panel.setStatus('Проверяю данные...');
+    const parsed = runtime.adapter.parseLocalCacheReads(reads);
+    const finalStats = parsed.stats;
+    const diagnostics = parsed.diagnostics || {};
+
+    for (const passStats of diagnostics.passStats || []) {
+      log.write('MESSAGE_BATCH', {
+        reason: 'local-cache-pass',
+        pass: passStats.pass,
+        totalPasses,
+        extraPass: passStats.pass > 1,
+        received: passStats.received,
+        added: passStats.added,
+        updated: passStats.updated,
+        duplicates: passStats.duplicates,
+        malformed: passStats.malformed,
+        cacheControl: passStats.cacheControl ?? null,
+        version: passStats.version ?? null,
+        total: passStats.totalAfterPass ?? finalStats.total,
+        user: finalStats.user,
+        assistant: finalStats.assistant,
+        other: finalStats.other,
+      });
+    }
+
+    log.write('LOCAL_CACHE_PARSED', {
+      adapter: runtime.adapter.id,
+      reads: reads.length,
+      sourceMessages: diagnostics.sourceMessages ?? null,
+      uniqueMessageIds: diagnostics.uniqueMessageIds ?? null,
+    });
+
+    for (const entry of diagnostics.logEntries || []) {
+      if (entry?.event) {
+        log.write(entry.event, entry.details || {});
+      }
+    }
+
+    runtime.panel.setMessageCount(finalStats.total);
+    runtime.panel.stopTimer();
+    runtime.panel.setStatus('Формирую файл...');
+
+    const artifact = buildNetworkMarkdownArtifact(parsed.conversation);
+    const workDurationMs = Date.now() - runtime.startedAt;
+    const passAdditions = (diagnostics.passStats || []).map((item) => item.added);
+
+    log.write('EXPORT_READY', {
+      format: 'markdown',
+      filename: artifact.filename,
+      messages: finalStats.total,
+      passes: totalPasses,
+      extraPasses: Math.max(0, totalPasses - 1),
+      passAdditions,
+      acquisitionMode: 'local-cache',
+      workDurationMs,
+      workDuration: loggerModule.formatDuration(workDurationMs),
+    });
+
+    if (currentSettings.autoSave) {
+      runtime.panel.setStatus('Сохраняю файл...');
+      await saveMarkdownArtifact(artifact, 'auto', { saveAs: false });
+      runtime.panel.setStatus('Сохранено.');
+      runtime.panel.setCloseTitle('Закрыть');
+      runtime.panel.markDone();
+
+      const durationMs = Date.now() - runtime.startedAt;
+      log.write('COMPLETED', {
+        reason: `${runtime.adapter.id}-local-cache-markdown-export`,
+        messages: finalStats.total,
+        user: finalStats.user,
+        assistant: finalStats.assistant,
+        passes: totalPasses,
+        extraPasses: Math.max(0, totalPasses - 1),
+        passAdditions,
+        acquisitionMode: 'local-cache',
+        workDurationMs,
+        workDuration: loggerModule.formatDuration(workDurationMs),
+        durationMs,
+        duration: loggerModule.formatDuration(durationMs),
+        filename: artifact.filename,
+      });
+      if (currentSettings.autoClosePanel) {
+        log.write('PANEL_AUTO_CLOSE', { reason: 'auto-save' });
+      }
+      await log.saveOnce('COMPLETED');
+      if (currentSettings.autoClosePanel) {
+        runtime.panel?.remove?.();
+      }
+      return false;
+    }
+
+    runtime.panel.setStatus('Сбор завершен.');
+    runtime.panel.setCloseTitle('Закрыть');
+    runtime.panel.markDone();
+    log.write('WAITING_FOR_SAVE_DECISION', {
+      messages: finalStats.total,
+      passes: totalPasses,
+      filename: artifact.filename,
+    });
+
+    const action = await waitForManualExportAction(artifact, finalStats);
+    if (runtime.aborted || action.state === 'aborted') {
+      return false;
+    }
+
+    if (action.state === 'cancelled') {
+      log.write('COMPLETED', {
+        reason: 'markdown-save-cancelled',
+        messages: finalStats.total,
+        passes: totalPasses,
+        workDurationMs,
+        workDuration: loggerModule.formatDuration(workDurationMs),
+      });
+      await log.saveOnce('CANCELLED');
+      return false;
+    }
+
+    const durationMs = Date.now() - runtime.startedAt;
+    log.write('COMPLETED', {
+      reason: `${runtime.adapter.id}-local-cache-markdown-export-manual`,
+      messages: finalStats.total,
+      user: finalStats.user,
+      assistant: finalStats.assistant,
+      passes: totalPasses,
+      extraPasses: Math.max(0, totalPasses - 1),
+      passAdditions,
+      acquisitionMode: 'local-cache',
+      workDurationMs,
+      workDuration: loggerModule.formatDuration(workDurationMs),
+      durationMs,
+      duration: loggerModule.formatDuration(durationMs),
+      filename: artifact.filename,
+    });
+    if (currentSettings.autoClosePanel) {
+      log.write('PANEL_AUTO_CLOSE', { reason: 'manual-save' });
+    }
+    await log.saveOnce('COMPLETED');
+    if (currentSettings.autoClosePanel) {
+      runtime.panel?.remove?.();
+    }
+    return false;
+  }
+
   async function runNetworkAdapter(currentSettings, detection) {
     runtime.networkMode = true;
     runtime.adapter = detection.adapter;
@@ -1489,6 +1991,25 @@
 
     if (!runtime.adapter) {
       throw new Error('Не удалось определить адаптер страницы.');
+    }
+
+    if (runtime.adapter.acquisitionMode === 'local-cache') {
+      try {
+        const reloadPending = await runLocalCacheAdapter(currentSettings, detection);
+        if (!reloadPending) {
+          runtime.running = false;
+        }
+      } catch (error) {
+        console.warn('Chat Context Exporter: ошибка локального адаптера.', error);
+        const message = error instanceof Error ? error.message : String(error);
+        log.write('ERROR', { message });
+        runtime.panel?.setStatus(`Ошибка: ${message}`);
+        runtime.panel?.markError();
+        runtime.running = false;
+        await sendLocalCacheSyncMessage({ type: LOCAL_CACHE_SYNC_RELEASE_MESSAGE }).catch(() => {});
+        await log.saveOnce('ERROR');
+      }
+      return;
     }
 
     if (runtime.adapter.acquisitionMode === 'network') {

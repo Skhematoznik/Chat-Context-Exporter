@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.7.1 — 2026-09-28
+
+DeepSeek local-cache acquisition синхронизирован с фактическим поведением сайта после live-ответов.
+
+- каждый явный запуск DeepSeek-экспорта теперь сначала выполняет один обычный reload текущей вкладки, независимо от того, были ли новые сообщения;
+- reload используется только как штатный триггер синхронизации самого DeepSeek: расширение не делает собственных API-запросов и не меняет site storage;
+- после завершения навигации расширение выдерживает короткий grace period и требует два одинаковых последовательных read-only snapshot fingerprint перед первым экспортным чтением, чтобы не схватить старую запись в момент обновления IndexedDB;
+- после стабилизации полная история читается из `IndexedDB: deepseek-chat / history-message` по текущему `chat_session_id`; DOM и scrolling по-прежнему не используются;
+- дополнительные проходы DeepSeek не перезагружают страницу повторно: они повторяют только read-only чтение базы и merge по `message_id`;
+- исправлено форматирование восстановленных DeepSeek citations: перед автоматически вставленной ссылкой `[N](URL)` добавляется ровно один пробел, если в исходном `RESPONSE` перед reference-marker не было whitespace;
+- правило пробела применяется только к DeepSeek reference reconstruction и не меняет обычные Markdown-ссылки пользователя/ассистента;
+- Grok/Claude network adapters, ChatGPT DOM adapter и общий Markdown exporter функционально не менялись.
+
+## 0.7.0 — 2026-09-28
+
+DeepSeek переведен с DOM collection на read-only local-cache acquisition.
+
+- старый DeepSeek DOM adapter удален и заменен адаптером чтения `IndexedDB: deepseek-chat / history-message`;
+- ключ записи — текущий `chat_session_id`, извлекаемый из URL разговора;
+- чтение выполняется одноразовым `chrome.scripting.executeScript(..., world="MAIN")` и readonly-транзакцией; расширение не делает `put`, `delete`, `clear` и не очищает кеш DeepSeek;
+- подтверждена модель синхронизации DeepSeek: cold-cache response дает `REPLACE` + полный `chat_messages[]`, warm-cache response дает `MERGE` + дельту либо пустой массив;
+- контрольный cold-cache fixture содержит 22 сообщения (11 user + 11 assistant), `message_id=1..22`, непрерывный `parent_id`, `status=FINISHED` и timestamps 22/22;
+- `REQUEST` экспортируется как сообщение пользователя, `RESPONSE` — как финальный ответ ассистента; `THINK`, `TOOL_SEARCH`, `TOOL_OPEN` не попадают в текст диалога;
+- ссылки для `TOOL_OPEN`, которые однозначно сопоставляются с результатом поиска, восстанавливаются в Markdown; неразрешимые `TOOL_SEARCH` reference markers не выводятся, без выдумывания URL;
+- дополнительные проходы DeepSeek повторно читают local-cache snapshot и объединяют данные по `message_id`, позволяя подхватить изменения, записанные сайтом между проходами;
+- DeepSeek больше не прокручивает страницу, не читает сообщения из DOM и не перезагружает страницу для обычного экспорта;
+- панель DeepSeek использует тот же компактный структурированный режим: без `Метод`, `Шаг` и `Позиция`;
+- в ручном режиме после завершения сбора вторая кнопка теперь подписана `Закрыть`, а не `Отмена`;
+- Grok и Claude network adapters, ChatGPT DOM adapter и общий Markdown формат 0.6.0 функционально не менялись.
+
 ## 0.6.0 — 2026-09-28
 
 Добавлен второй полностью сетевой адаптер — Claude.

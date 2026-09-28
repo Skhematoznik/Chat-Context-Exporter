@@ -27,6 +27,10 @@ const CAPTURE_GET_STATE_MESSAGE = 'chat-context-exporter:capture:get-state';
 const CAPTURE_CANCEL_MESSAGE = 'chat-context-exporter:capture:cancel';
 const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
 const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
+const PAGE_INDEXEDDB_GET_MESSAGE = 'chat-context-exporter:indexeddb:get';
+const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
+const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
+const LOCAL_CACHE_SYNC_RELEASE_MESSAGE = 'chat-context-exporter:local-cache-sync:release';
 
 const ALLOWED_TEXT_MIME_TYPES = new Set([
   'text/plain',
@@ -36,6 +40,8 @@ const ALLOWED_TEXT_MIME_TYPES = new Set([
 const SAVE_REQUEST_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_CAPTURE_TIMEOUT_MS = 60_000;
 const MAX_CAPTURE_BODY_BYTES = 100 * 1024 * 1024;
+const LOCAL_CACHE_SYNC_TTL_MS = 2 * 60 * 1000;
+const LOCAL_CACHE_SYNC_STORAGE_PREFIX = 'chat-context-exporter:local-cache-sync:';
 const saveRequests = new Map();
 const captureSessions = new Map();
 
@@ -635,6 +641,172 @@ async function releaseCaptureSession(tabId) {
   return { ok: true, state };
 }
 
+function localCacheSyncStorageKey(tabId) {
+  return `${LOCAL_CACHE_SYNC_STORAGE_PREFIX}${tabId}`;
+}
+
+async function getLocalCacheSyncSession(tabId) {
+  const key = localCacheSyncStorageKey(tabId);
+  const stored = await chrome.storage.session.get(key);
+  const session = stored?.[key];
+  if (!session || typeof session !== 'object') {
+    return null;
+  }
+
+  const startedAt = Number(session.startedAt) || 0;
+  if (!startedAt || nowMs() - startedAt > LOCAL_CACHE_SYNC_TTL_MS) {
+    await chrome.storage.session.remove(key).catch(() => {});
+    return null;
+  }
+
+  return session;
+}
+
+async function setLocalCacheSyncSession(tabId, session) {
+  const key = localCacheSyncStorageKey(tabId);
+  await chrome.storage.session.set({ [key]: session });
+}
+
+async function removeLocalCacheSyncSession(tabId) {
+  await chrome.storage.session.remove(localCacheSyncStorageKey(tabId));
+}
+
+async function startLocalCacheSyncSession(tabId, message) {
+  const existing = await getLocalCacheSyncSession(tabId);
+  if (existing) {
+    return { ok: true, state: existing };
+  }
+
+  const startedAt = nowMs();
+  const state = {
+    id: createId('local-cache-sync'),
+    tabId,
+    adapterId: typeof message.adapterId === 'string' ? message.adapterId : null,
+    sessionId: typeof message.sessionId === 'string' ? message.sessionId : null,
+    page: typeof message.page === 'string' ? message.page : null,
+    title: typeof message.title === 'string' ? message.title : null,
+    version: typeof message.version === 'string' ? message.version : null,
+    phase: 'reloading',
+    startedAt,
+    reloadRequestedAt: startedAt,
+    reloadCompletedAt: null,
+  };
+
+  await setLocalCacheSyncSession(tabId, state);
+  setTimeout(() => {
+    void chrome.tabs.reload(tabId, { bypassCache: false }).catch(async (error) => {
+      const failedState = {
+        ...state,
+        phase: 'error',
+        error: error instanceof Error ? error.message : String(error),
+      };
+      await setLocalCacheSyncSession(tabId, failedState).catch(() => {});
+      await injectRuntime(tabId).catch(() => {});
+    });
+  }, 80);
+
+  return { ok: true, state };
+}
+
+async function handleLocalCacheSyncMessage(message, sender) {
+  const tabId = sender.tab?.id;
+  if (!tabId) {
+    return { ok: false, error: 'Не удалось определить вкладку локальной синхронизации.' };
+  }
+
+  if (message.type === LOCAL_CACHE_SYNC_START_MESSAGE) {
+    return startLocalCacheSyncSession(tabId, message);
+  }
+
+  if (message.type === LOCAL_CACHE_SYNC_GET_STATE_MESSAGE) {
+    return { ok: true, state: await getLocalCacheSyncSession(tabId) };
+  }
+
+  if (message.type === LOCAL_CACHE_SYNC_RELEASE_MESSAGE) {
+    const state = await getLocalCacheSyncSession(tabId);
+    await removeLocalCacheSyncSession(tabId).catch(() => {});
+    return { ok: true, state };
+  }
+
+  return { ok: false, error: 'Неизвестная команда локальной синхронизации.' };
+}
+
+async function readIndexedDbRecordInMainWorld(tabId, message) {
+  const databaseName = typeof message.databaseName === 'string' ? message.databaseName.trim() : '';
+  const storeName = typeof message.storeName === 'string' ? message.storeName.trim() : '';
+  const key = typeof message.key === 'string' ? message.key : message.key;
+
+  if (!databaseName || !storeName || key === undefined || key === null) {
+    return { ok: false, error: 'Некорректные параметры чтения IndexedDB.' };
+  }
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: async (dbName, objectStoreName, recordKey) => {
+      if (!globalThis.indexedDB) {
+        return { found: false, reason: 'indexeddb-unavailable' };
+      }
+
+      if (typeof indexedDB.databases === 'function') {
+        const databases = await indexedDB.databases();
+        const existing = databases.find((item) => item?.name === dbName);
+        if (!existing) {
+          return { found: false, reason: 'database-missing' };
+        }
+      }
+
+      const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open(dbName);
+        request.onerror = () => reject(request.error || new Error('IndexedDB open failed.'));
+        request.onupgradeneeded = () => {
+          try {
+            request.transaction?.abort();
+          } catch {}
+          reject(new Error('IndexedDB database did not exist before read.'));
+        };
+        request.onsuccess = () => resolve(request.result);
+      });
+
+      try {
+        if (!database.objectStoreNames.contains(objectStoreName)) {
+          return {
+            found: false,
+            reason: 'store-missing',
+            databaseVersion: database.version,
+          };
+        }
+
+        const record = await new Promise((resolve, reject) => {
+          const transaction = database.transaction(objectStoreName, 'readonly');
+          const store = transaction.objectStore(objectStoreName);
+          const request = store.get(recordKey);
+          request.onerror = () => reject(request.error || new Error('IndexedDB get failed.'));
+          request.onsuccess = () => resolve(request.result);
+          transaction.onabort = () => reject(transaction.error || new Error('IndexedDB readonly transaction aborted.'));
+        });
+
+        return {
+          found: record !== undefined,
+          reason: record === undefined ? 'record-missing' : null,
+          databaseVersion: database.version,
+          record: record === undefined ? null : record,
+        };
+      } finally {
+        database.close();
+      }
+    },
+    args: [databaseName, storeName, key],
+  });
+
+  const result = results?.[0]?.result;
+  if (!result || typeof result !== 'object') {
+    return { ok: false, error: 'Чтение IndexedDB не вернуло результат.' };
+  }
+
+  return { ok: true, result };
+}
+
 async function handleCaptureMessage(message, sender) {
   const tabId = sender.tab?.id;
   if (!tabId) {
@@ -704,6 +876,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (
+    message.type === LOCAL_CACHE_SYNC_START_MESSAGE
+    || message.type === LOCAL_CACHE_SYNC_GET_STATE_MESSAGE
+    || message.type === LOCAL_CACHE_SYNC_RELEASE_MESSAGE
+  ) {
+    handleLocalCacheSyncMessage(message, sender)
+      .then((response) => sendResponse(response))
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    return true;
+  }
+
+  if (message.type === PAGE_INDEXEDDB_GET_MESSAGE) {
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'Не удалось определить вкладку для чтения IndexedDB.' });
+      return true;
+    }
+
+    readIndexedDbRecordInMainWorld(tabId, message)
+      .then((response) => sendResponse(response))
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    return true;
+  }
+
+  if (
     message.type === CAPTURE_START_MESSAGE
     || message.type === CAPTURE_GET_STATE_MESSAGE
     || message.type === CAPTURE_CANCEL_MESSAGE
@@ -729,27 +935,43 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 
   const session = captureSessions.get(tabId);
-  if (!session || ['released', 'cancelled'].includes(session.phase)) {
+  if (session && !['released', 'cancelled'].includes(session.phase)) {
+    const completedAt = nowMs();
+    const duplicateCompletion = session.lastReloadCompletedPass === session.pass
+      && completedAt - session.lastReloadCompletedAt < 500;
+
+    if (!duplicateCompletion) {
+      session.lastReloadCompletedPass = session.pass;
+      session.lastReloadCompletedAt = completedAt;
+      appendCaptureEvent(session, 'PAGE_RELOAD_COMPLETED', {
+        pass: session.pass,
+        totalPasses: session.totalPasses,
+        phase: session.phase,
+      });
+    }
+    void injectRuntime(tabId).catch(() => {});
     return;
   }
 
-  const completedAt = nowMs();
-  const duplicateCompletion = session.lastReloadCompletedPass === session.pass
-    && completedAt - session.lastReloadCompletedAt < 500;
+  void (async () => {
+    const localCacheSession = await getLocalCacheSyncSession(tabId);
+    if (!localCacheSession || localCacheSession.phase !== 'reloading') {
+      return;
+    }
 
-  if (!duplicateCompletion) {
-    session.lastReloadCompletedPass = session.pass;
-    session.lastReloadCompletedAt = completedAt;
-    appendCaptureEvent(session, 'PAGE_RELOAD_COMPLETED', {
-      pass: session.pass,
-      totalPasses: session.totalPasses,
-      phase: session.phase,
-    });
-  }
-  void injectRuntime(tabId).catch(() => {});
+    const readyState = {
+      ...localCacheSession,
+      phase: 'ready',
+      reloadCompletedAt: nowMs(),
+    };
+    await setLocalCacheSyncSession(tabId, readyState);
+    await injectRuntime(tabId).catch(() => {});
+  })();
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  void removeLocalCacheSyncSession(tabId).catch(() => {});
+
   const session = captureSessions.get(tabId);
   if (!session) {
     return;

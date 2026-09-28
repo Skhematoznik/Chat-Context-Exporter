@@ -437,7 +437,7 @@
           details: {
             blocks: normalized.stats.unsupportedContentBlocks,
             types: normalized.stats.unsupportedContentTypes,
-            note: 'only text content blocks are exported in 0.6.0',
+            note: 'only text content blocks are currently exported',
           },
         });
       }

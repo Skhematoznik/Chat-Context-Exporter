@@ -211,7 +211,7 @@
           </div>
           <div class="actions" hidden>
             <button class="action-button primary save" type="button">Сохранить</button>
-            <button class="action-button cancel" type="button">Отмена</button>
+            <button class="action-button cancel" type="button">Закрыть</button>
           </div>
           <div class="progress"><div></div></div>
         </div>

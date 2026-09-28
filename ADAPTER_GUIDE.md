@@ -34,9 +34,26 @@ Network adapter определяет:
 
 Transport отвечает только за attach/Network.enable/reload/request tracking/getResponseBody/detach и не знает структуру JSON конкретного сервиса.
 
+
+## Local-cache adapter
+
+Если сервис после initial load хранит каноническую историю в browser storage и сетевой endpoint возвращает только `REPLACE`/`MERGE` snapshots, допустим read-only local-cache adapter:
+
+```text
+optional page reload for service-side cache sync
+→ page IndexedDB (readonly)
+→ service adapter
+→ NormalizedConversation
+→ exporter
+```
+
+Такой adapter должен явно определить database/store/key, стабильные message IDs, parent-chain, критерий полноты и timestamp. Чтение storage выполняется только после явного запуска пользователем. Не допускаются `put`, `delete`, `clear`, принудительное очищение кеша сайта или собственные backend-запросы.
+
+DeepSeek 0.7.1 при каждом запуске сначала делает обычный reload текущего разговора, чтобы сам DeepSeek синхронизировал локальную историю, затем после короткой проверки стабильности read-only читает `deepseek-chat / history-message`, ключ `chat_session_id`. Дополнительные проходы повторяют только чтение базы и объединяются по `message_id`. DOM и scrolling не используются.
+
 ## Tree
 
-Если endpoint возвращает дерево, наличие массива сообщений не означает, что нужно экспортировать весь массив. Адаптер должен использовать фактический active/current leaf и parent links. Claude 0.6.0 строит текущую ветку от `current_leaf_message_uuid` к root.
+Если endpoint возвращает дерево, наличие массива сообщений не означает, что нужно экспортировать весь массив. Адаптер должен использовать фактический active/current leaf и parent links. Claude строит текущую ветку от `current_leaf_message_uuid` к root.
 
 ## Scroll
 
@@ -46,7 +63,7 @@ Scrolling не является обязательной частью адапт
 
 ## Дополнительные проходы
 
-Дополнительный проход — повтор acquisition-процесса конкретного адаптера. Network adapter объединяет результаты по стабильным ID и не должен терять сообщения, найденные только в одном из проходов.
+Дополнительный проход — повтор acquisition-процесса конкретного адаптера. Network adapter объединяет результаты по стабильным ID и не должен терять сообщения, найденные только в одном из проходов. Local-cache adapter аналогично повторно читает readonly snapshot и выполняет merge по стабильным ID.
 
 ## Панель
 
@@ -54,7 +71,7 @@ Scrolling не является обязательной частью адапт
 
 ## DOM adapter
 
-DOM остается временным способом для еще не мигрированных сервисов. При успешном переводе сервиса на network capture его старый DOM adapter и ставший неиспользуемым site-specific код удаляются.
+DOM остается временным способом для еще не мигрированных сервисов. При успешном переводе сервиса на структурированный network/local-cache acquisition его старый DOM adapter и ставший неиспользуемым site-specific код удаляются.
 
 ## Репозиторий
 
