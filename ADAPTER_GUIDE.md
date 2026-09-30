@@ -17,7 +17,7 @@
 - `IndexedDB` transaction только в режиме `readonly`;
 - `chrome.debugger` для пассивного наблюдения за штатными network responses страницы;
 - `Network.enable` и `Network.getResponseBody` для ответа, который сама страница уже получила;
-- обычный reload вкладки и, для legacy DOM-adapter, browser scrolling, если это часть штатного пользовательского поведения страницы;
+- обычный reload вкладки и browser scrolling, если это часть штатного пользовательского поведения страницы и требуется pagination-моделью адаптера;
 - локальный parsing, validation, merge, Markdown generation и сохранение через extension APIs.
 
 Запрещено:
@@ -81,6 +81,29 @@ Transport не сканирует все responses и не сохраняет п
 
 Service-specific parser находится в `src/adapters/chatgpt/shared-wire-parser.js` и обязан валидировать `shareId`, raw IDs, parent-chain и `current_node`. Старый Shared DOM collector и discovery-логика 0.8.0 в production runtime не сохраняются.
 
+## ChatGPT authenticated thread paginated network adapter
+
+Production 0.8.6 для ChatGPT thread URL с конечным сегментом `/c/<conversation-id>` использует гибридный transport: transcript читается только из штатных JSON responses, а `ISOLATED` content script локально изменяет позицию scroll-контейнера исключительно как trigger штатной pagination страницы.
+
+В 0.8.6 этот trigger использует `direct-fast-pagination`: шаг равен примерно пяти высотам видимого scroll-контейнера (минимум 1200 px), после чего capture state проверяется снова. Это изменение не затрагивает wire parser и не превращает extension в инициатора backend pagination request.
+В 0.8.6 после обнаружения ожидаемого `/messages?before=<cursor>` дальнейшие scroll-команды блокируются до получения/обработки ответа; только затем разрешается следующий pagination trigger.
+
+```text
+ordinary reload
+→ GET /backend-api/conversations/<id>?num_turns=10...
+→ passive Network.getResponseBody
+→ messages[] + page_info
+→ has_previous_page=true
+→ configured-delay browser scroll up
+→ page itself GET .../messages?before=<previous start_cursor>...
+→ passive Network.getResponseBody
+→ repeat until has_previous_page=false
+```
+
+Adapter не имеет права самостоятельно конструировать/отправлять `messages?before=`. Cursor используется только для validation уже наблюдаемой цепочки: request `before` следующей страницы должен совпасть с `start_cursor` предыдущего response. Первый response прохода должен быть tail (`has_next_page=false`), последний — start (`has_previous_page=false`).
+
+Site-specific JSON parser находится в `src/adapters/chatgpt/thread-wire-parser.js`. Он фильтрует внутренние `system/tool/thoughts/reasoning` records и нормализует только visible user + assistant final. Старый DOM transcript parser authenticated thread удален; DOM используется только для read-only поиска scroll-контейнера и browser-level scroll.
+
 ## Local-cache adapter
 
 Если сервис хранит каноническую историю в browser storage, допустим только read-only local-cache adapter:
@@ -118,7 +141,7 @@ Scrolling не является обязательной частью адапт
 
 ## DOM adapter
 
-DOM остается временным способом для еще не мигрированных сервисов. Он также обязан соблюдать passive/read-only invariant: никакого page-world code, backend-запросов или изменения application state. При успешном переводе сервиса на структурированный network/local-cache acquisition его старый DOM adapter и ставший неиспользуемым site-specific код удаляются.
+DOM остается fallback-классом только для сервисов, для которых еще не найден структурированный источник. Он также обязан соблюдать passive/read-only invariant: никакого page-world code, backend-запросов или изменения application state. При успешном переводе сервиса на структурированный network/local-cache acquisition его старый DOM adapter и ставший неиспользуемым site-specific код удаляются.
 
 ## Репозиторий
 

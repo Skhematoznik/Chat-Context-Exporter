@@ -81,6 +81,8 @@
   const CAPTURE_GET_STATE_MESSAGE = 'chat-context-exporter:capture:get-state';
   const CAPTURE_CANCEL_MESSAGE = 'chat-context-exporter:capture:cancel';
   const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
+  const CAPTURE_CONTINUE_MESSAGE = 'chat-context-exporter:capture:continue';
+  const CAPTURE_SCROLL_STEP_MESSAGE = 'chat-context-exporter:capture:scroll-step';
   const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
   const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
   const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -88,6 +90,8 @@
   const LOCAL_CACHE_POST_RELOAD_MIN_WAIT_MS = 1500;
   const LOCAL_CACHE_STABILITY_INTERVAL_MS = 350;
   const LOCAL_CACHE_STABILITY_MATCHES = 2;
+  const CHATGPT_NETWORK_FAST_SCROLL_SETTLE_MS = 120;
+  const CHATGPT_NETWORK_RESPONSE_POLL_MS = 200;
 
   async function resolveSettings() {
     if (runtime.settings) {
@@ -318,7 +322,7 @@
     const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
     const blockCount = messages.reduce((sum, message) => sum + (Array.isArray(message.blocks) ? message.blocks.length : 0), 0);
     const emptyMessages = messages.reduce((sum, message) => sum + ((message.blocks?.length || 0) === 0 ? 1 : 0), 0);
-    const preferredTitle = runtime.adapter?.variant === 'shared-public'
+    const preferredTitle = runtime.adapter?.id === 'chatgpt'
       ? conversation?.title
       : null;
     const pageTitle = String(preferredTitle || document.title || '').trim()
@@ -1166,6 +1170,9 @@
     }
 
     runtime.panel.setPass(Math.max(1, state.pass || 1), Math.max(1, state.totalPasses || 1));
+    if (Number.isFinite(Number(state.pageState?.transcriptMessagesInPass))) {
+      runtime.panel.setMessageCount(Number(state.pageState.transcriptMessagesInPass));
+    }
 
     switch (state.phase) {
       case 'attaching':
@@ -1175,7 +1182,10 @@
         runtime.panel.setStatus('Перезагружаю страницу...');
         break;
       case 'capturing':
-        runtime.panel.setStatus('Получаю историю...');
+        runtime.panel.setStatus(state.paginationMode ? 'Жду предыдущую страницу...' : 'Получаю историю...');
+        break;
+      case 'awaiting-scroll':
+        runtime.panel.setStatus('Прокручиваю к предыдущей странице...');
         break;
       case 'waiting-next-pass':
         runtime.panel.setStatus('Готовлю дополнительный проход...');
@@ -1195,7 +1205,205 @@
     }
   }
 
-  async function waitForNetworkCaptureState(initialState) {
+  async function waitForNetworkScroller() {
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      if (runtime.aborted) {
+        return null;
+      }
+      const selected = runtime.adapter.findScroller?.() || null;
+      if (selected instanceof HTMLElement) {
+        runtime.scrollContainer = selected;
+        setPanelScrollState(selected);
+        return selected;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error('ChatGPT Thread: не найден scroll-контейнер разговора после reload.');
+      }
+      const completed = await sleep(250, runtime.abortController.signal);
+      if (!completed) {
+        return null;
+      }
+    }
+  }
+
+  function hasPendingPaginationRequest(state, previousPageSequence) {
+    const request = state?.paginationRequest;
+    if (!request?.requestId) {
+      return false;
+    }
+    return (Number(request.pageSequence) || 0) === previousPageSequence;
+  }
+
+  async function waitForPendingPaginationRequest(state, previousPageSequence) {
+    let currentState = state;
+
+    while (
+      currentState?.phase === 'capturing'
+      && hasPendingPaginationRequest(currentState, previousPageSequence)
+    ) {
+      if (runtime.aborted) {
+        return null;
+      }
+
+      const completed = await sleep(CHATGPT_NETWORK_RESPONSE_POLL_MS, runtime.abortController.signal);
+      if (!completed || runtime.aborted) {
+        return null;
+      }
+
+      const response = await sendCaptureMessage({
+        type: CAPTURE_GET_STATE_MESSAGE,
+        includeCaptures: false,
+      });
+      currentState = response.state;
+      updateNetworkPanel(currentState);
+
+      const pageSequence = Number(currentState?.pageState?.pageSequence) || previousPageSequence;
+      if (pageSequence > previousPageSequence) {
+        return currentState;
+      }
+    }
+
+    return currentState;
+  }
+
+  async function advanceNetworkPagination(state, currentSettings) {
+    if (!state || state.phase !== 'awaiting-scroll') {
+      return state;
+    }
+
+    const previousPageSequence = Number(state.pageState?.pageSequence) || 0;
+    const armResponse = await sendCaptureMessage({
+      type: CAPTURE_CONTINUE_MESSAGE,
+      iteration: runtime.operationStep + 1,
+    });
+    let currentState = armResponse.state;
+    if (!currentState || currentState.phase !== 'capturing') {
+      return currentState;
+    }
+
+    let scrollContainer = await waitForNetworkScroller();
+    if (!(scrollContainer instanceof HTMLElement)) {
+      return null;
+    }
+
+    log.write('CHATGPT_THREAD_PAGINATION_SCROLL_MODE', {
+      mode: 'fast-direct',
+      stepViewports: scroller.FAST_SCROLL_STEP_VIEWPORTS ?? null,
+      minStepPx: scroller.FAST_MIN_SCROLL_STEP_PX ?? null,
+      clientHeight: scrollContainer.clientHeight,
+      stepPx: scroller.getFastStepPx?.(scrollContainer) ?? null,
+      settleMs: CHATGPT_NETWORK_FAST_SCROLL_SETTLE_MS,
+    });
+
+    for (let localStep = 1; localStep <= MAX_ITERATIONS; localStep += 1) {
+      if (runtime.aborted) {
+        return null;
+      }
+
+      // Honor the configured quiet interval between pagination scroll actions.
+      const minDelay = Math.min(currentSettings.minDelayMs, currentSettings.maxDelayMs);
+      const maxDelay = Math.max(currentSettings.minDelayMs, currentSettings.maxDelayMs);
+      const delayMs = randomInteger(minDelay, maxDelay);
+      log.write('WAIT', { reason: 'chatgpt-thread-pagination', delayMs });
+      const completedDelay = await sleep(delayMs, runtime.abortController.signal);
+      if (!completedDelay || runtime.aborted) {
+        return null;
+      }
+
+      const stateResponse = await sendCaptureMessage({
+        type: CAPTURE_GET_STATE_MESSAGE,
+        includeCaptures: false,
+      });
+      currentState = stateResponse.state;
+      updateNetworkPanel(currentState);
+      if (!currentState || currentState.phase !== 'capturing') {
+        return currentState;
+      }
+
+      if (hasPendingPaginationRequest(currentState, previousPageSequence)) {
+        currentState = await waitForPendingPaginationRequest(currentState, previousPageSequence);
+        if (!currentState || currentState.phase !== 'capturing') {
+          return currentState;
+        }
+        const waitedPageSequence = Number(currentState.pageState?.pageSequence) || previousPageSequence;
+        if (waitedPageSequence > previousPageSequence) {
+          return currentState;
+        }
+        // The matching request disappeared without advancing the page (for example,
+        // capture recovery). Resume scrolling only in that exceptional case.
+      }
+
+      if (!scrollContainer.isConnected) {
+        scrollContainer = await waitForNetworkScroller();
+        if (!(scrollContainer instanceof HTMLElement)) {
+          return null;
+        }
+      }
+
+      const before = setPanelScrollState(scrollContainer);
+      const step = nextStep();
+      const command = scroller.scrollUpFastStep(scrollContainer, getScrollMode());
+
+      // Fast pagination uses direct local scrollTop movement, so only a short settle
+      // interval is needed for ChatGPT's virtualized list and scroll listeners.
+      await sleep(CHATGPT_NETWORK_FAST_SCROLL_SETTLE_MS, runtime.abortController.signal);
+      const after = setPanelScrollState(scrollContainer);
+      const moved = logScrollResult({
+        direction: 'up',
+        step,
+        before,
+        after,
+        requestedStepPx: command.stepPx,
+      });
+      await sendCaptureMessage({
+        type: CAPTURE_SCROLL_STEP_MESSAGE,
+        iteration: step,
+        step: localStep,
+        stepPx: command.stepPx,
+        from: command.from,
+        target: command.target,
+        immediate: command.immediate,
+        strategy: command.strategy,
+        delayMs,
+        actual: after.top,
+        delta: after.top - before.top,
+        moved,
+        scrollHeight: after.height,
+        clientHeight: after.client,
+      });
+
+      const postScrollResponse = await sendCaptureMessage({
+        type: CAPTURE_GET_STATE_MESSAGE,
+        includeCaptures: false,
+      });
+      currentState = postScrollResponse.state;
+      updateNetworkPanel(currentState);
+      if (!currentState) {
+        return null;
+      }
+
+      if (currentState.phase !== 'capturing') {
+        return currentState;
+      }
+
+      if (hasPendingPaginationRequest(currentState, previousPageSequence)) {
+        currentState = await waitForPendingPaginationRequest(currentState, previousPageSequence);
+        if (!currentState || currentState.phase !== 'capturing') {
+          return currentState;
+        }
+      }
+
+      const pageSequence = Number(currentState.pageState?.pageSequence) || previousPageSequence;
+      if (pageSequence > previousPageSequence) {
+        return currentState;
+      }
+    }
+
+    throw new Error(`ChatGPT Thread: превышен лимит ${MAX_ITERATIONS} scroll-шагов для одной страницы пагинации.`);
+  }
+
+  async function waitForNetworkCaptureState(initialState, currentSettings, config) {
     let state = initialState;
 
     for (;;) {
@@ -1206,6 +1414,11 @@
       updateNetworkPanel(state);
       if (!state || ['ready', 'error', 'cancelled', 'released'].includes(state.phase)) {
         return state;
+      }
+
+      if (state.phase === 'awaiting-scroll' && config?.paginationMode === 'scroll-up-until-start') {
+        state = await advanceNetworkPagination(state, currentSettings);
+        continue;
       }
 
       const completed = await sleep(350, runtime.abortController.signal);
@@ -1842,6 +2055,8 @@
         requestResourceType: config.resourceType || null,
         responseProcessor: config.responseProcessor || null,
         expectedShareId: config.expectedShareId || null,
+        expectedConversationId: config.expectedConversationId || null,
+        paginationMode: config.paginationMode || null,
         timeoutMs: config.timeoutMs || 60_000,
         totalPasses,
         minDelayMs: currentSettings.minDelayMs,
@@ -1887,7 +2102,7 @@
     runtime.panel.setMessageCount(0);
     updateNetworkPanel(state);
 
-    state = await waitForNetworkCaptureState(state);
+    state = await waitForNetworkCaptureState(state, currentSettings, config);
     if (!state || runtime.aborted) {
       return;
     }
@@ -1947,6 +2162,8 @@
         updated: passStats.updated,
         duplicates: passStats.duplicates,
         malformed: passStats.malformed,
+        pages: passStats.pages ?? null,
+        rawMessages: passStats.rawNodes ?? null,
         total: passStats.totalAfterPass ?? finalStats.total,
         user: finalStats.user,
         assistant: finalStats.assistant,
@@ -2096,7 +2313,6 @@
           runtime.running = false;
         }
       } catch (error) {
-        console.warn('Chat Context Exporter: ошибка локального адаптера.', error);
         const message = error instanceof Error ? error.message : String(error);
         log.write('ERROR', { message });
         runtime.panel?.setStatus(`Ошибка: ${message}`);
@@ -2115,7 +2331,6 @@
           runtime.running = false;
         }
       } catch (error) {
-        console.warn('Chat Context Exporter: ошибка сетевого адаптера.', error);
         const message = error instanceof Error ? error.message : String(error);
         log.write('ERROR', { message });
         runtime.panel?.setStatus(`Ошибка: ${message}`);
@@ -2394,7 +2609,6 @@
         runtime.panel?.remove?.();
       }
     } catch (error) {
-      console.warn('Chat Context Exporter: ошибка выполнения.', error);
       const message = error instanceof Error ? error.message : String(error);
       log.write('ERROR', { message });
       runtime.panel?.setStatus(`Ошибка: ${message}`);

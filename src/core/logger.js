@@ -167,7 +167,6 @@
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           write('LOG_SAVE_FAILED', { filename, message });
-          console.warn('Chat Context Exporter: не удалось сохранить лог.', error);
           return { ok: false, error: message };
         } finally {
           if (!saved) {

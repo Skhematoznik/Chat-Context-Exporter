@@ -6,7 +6,7 @@
 
 Grok и Claude используют permission `debugger` только для пассивного CDP Network capture: подключение к текущей вкладке, `Network.enable`, обычный reload, наблюдение за штатными запросами страницы, `Network.getResponseBody`, detach. Они не создают собственных backend-запросов.
 
-DeepSeek 0.7.2 выполняет обычный reload текущей страницы для штатной синхронизации локальной истории самим сайтом, после чего extension content script в `ISOLATED` world read-only читает конкретную IndexedDB-запись текущего `chat_session_id`. MAIN-world bridge отсутствует. ChatGPT Shared 0.8.1 использует только passive CDP `Network` observation + ordinary reload; захватывается основной GET Document текущей `/share/<id>` страницы, request interception и page-world execution не используются.
+DeepSeek 0.7.2 выполняет обычный reload текущей страницы для штатной синхронизации локальной истории самим сайтом, после чего extension content script в `ISOLATED` world read-only читает конкретную IndexedDB-запись текущего `chat_session_id`. MAIN-world bridge отсутствует. ChatGPT Shared 0.8.1 использует только passive CDP `Network` observation + ordinary reload; захватывается основной GET Document текущей `/share/<id>` страницы. ChatGPT authenticated thread 0.8.6 использует passive CDP Network capture штатных paginated JSON responses и локальное изменение `scrollTop` в `ISOLATED` world как pagination trigger; собственные backend-запросы отсутствуют.
 
 ### Разрешено
 
@@ -43,6 +43,16 @@ Network adapter должен читать только ответы, котор�
 - request/response headers, Cookie, Set-Cookie, Authorization и POST body не читаются/не логируются;
 - полный Document body не записывается в technical log и не сохраняется отдельным diagnostic artifact;
 - после локального parsing в runtime передается только normalized snapshot разговора.
+
+### ChatGPT authenticated thread 0.8.6 guardrails
+
+- matcher ограничен текущим conversation ID и `GET` URL вида `/backend-api/conversations/<id>` или `/backend-api/conversations/<id>/messages?...`;
+- extension не генерирует эти GET-запросы: initial response приходит после обычного reload, предыдущие страницы — только после штатной реакции интерфейса на browser scroll;
+- `Network.getResponseBody` вызывается только после `Network.loadingFinished`;
+- `page_info.start_cursor/end_cursor/has_previous_page/has_next_page` используются для проверки полноты и cursor-chain;
+- DOM не используется как источник transcript; только read-only поиск scroll-container и изменение scroll position;
+- `Runtime.evaluate`, `MAIN` world, `Fetch.enable`, request interception/mutation, response mutation и site-storage writes отсутствуют;
+- headers/cookies/tokens и POST body не читаются/не логируются.
 
 ## Bug reports
 

@@ -53,10 +53,6 @@
         maxDelayMs: clampDelay(stored.maxDelayMs, DEFAULT_SETTINGS.maxDelayMs),
       };
     } catch (error) {
-      console.warn(
-        'Chat Context Exporter: настройки недоступны, используются значения по умолчанию.',
-        error,
-      );
       return { ...DEFAULT_SETTINGS };
     }
   }

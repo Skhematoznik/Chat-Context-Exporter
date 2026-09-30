@@ -8,6 +8,8 @@
 
   const SCROLL_STEP_RATIO = 0.7;
   const MIN_SCROLL_STEP_PX = 240;
+  const FAST_SCROLL_STEP_VIEWPORTS = 5;
+  const FAST_MIN_SCROLL_STEP_PX = 1200;
 
   function isVisible(element) {
     const rect = element.getBoundingClientRect();
@@ -128,6 +130,13 @@
     );
   }
 
+  function getFastStepPx(element) {
+    return Math.max(
+      FAST_MIN_SCROLL_STEP_PX,
+      Math.round(element.clientHeight * FAST_SCROLL_STEP_VIEWPORTS),
+    );
+  }
+
   function restoreInlineScrollBehavior(element, previousScrollBehavior) {
     requestAnimationFrame(() => {
       if (element.isConnected) {
@@ -174,6 +183,22 @@
       target: safeTarget,
       immediate,
       strategy: 'direct-recovery',
+    };
+  }
+
+  function scrollUpFastStep(element, mode = 'normal') {
+    const stepPx = getFastStepPx(element);
+    const from = element.scrollTop;
+    const bounds = getScrollBounds(element, mode);
+    const target = Math.max(bounds.min, from - stepPx);
+    const immediate = applyDirectScrollTop(element, target);
+
+    return {
+      stepPx,
+      from,
+      target,
+      immediate,
+      strategy: 'direct-fast-pagination',
     };
   }
 
@@ -267,11 +292,14 @@
   }
 
   app.modules.scroller = {
+    FAST_MIN_SCROLL_STEP_PX,
+    FAST_SCROLL_STEP_VIEWPORTS,
     MIN_SCROLL_STEP_PX,
     SCROLL_STEP_RATIO,
     cancelCurrentScroll,
     describeElement,
     findGenericScrollContainer,
+    getFastStepPx,
     getScrollBounds,
     getStepPx,
     isScrollableElement,
@@ -280,6 +308,7 @@
     readScrollState,
     scrollDownOneStep,
     scrollToDirect,
+    scrollUpFastStep,
     scrollUpOneStep,
   };
 })();

@@ -155,7 +155,6 @@ function clearDelayedSaveTimers() {
 }
 
 function handleError(error, message) {
-  console.error(error);
   showMessage(message);
 }
 
@@ -235,7 +234,6 @@ async function initialize() {
     await loadSettings();
     initialized = true;
   } catch (error) {
-    console.error(error);
     render(DEFAULT_SETTINGS);
     initialized = true;
     showMessage('Не удалось прочитать настройки.');

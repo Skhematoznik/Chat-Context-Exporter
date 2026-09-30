@@ -11,10 +11,10 @@ Chat Context Exporter обрабатывает разговоры локальн
 - идентификаторы сообщений и parent-связи;
 - metadata, необходимую для определения полноты/порядка/активной ветки;
 - сведения о наличии вложений;
-- DOM текущей страницы для еще не мигрированных DOM-адаптеров;
+- DOM текущей страницы только там, где он нужен read-only для UI/scroller detection или еще не мигрированного DOM-acquisition;
 - для DeepSeek — локальную IndexedDB-запись выбранного `chat_session_id`.
 
-Grok и Claude получают данные из response body, который соответствующая страница сама получает при штатной загрузке разговора. DeepSeek 0.7.2 перед чтением выполняет обычный reload текущей страницы, после чего extension content script в `ISOLATED` world read-only читает запись из `IndexedDB: deepseek-chat / history-message`, которую синхронизирует и сохраняет сам сайт. ChatGPT Shared 0.8.1 после обычного reload читает только основной Document response текущей `/share/<id>` страницы и локально декодирует опубликованный snapshot из сериализованного React Router stream; живой DOM/React state не используется для acquisition.
+Grok и Claude получают данные из response body, который соответствующая страница сама получает при штатной загрузке разговора. DeepSeek 0.7.2 перед чтением выполняет обычный reload текущей страницы, после чего extension content script в `ISOLATED` world read-only читает запись из `IndexedDB: deepseek-chat / history-message`, которую синхронизирует и сохраняет сам сайт. ChatGPT Shared 0.8.1 после обычного reload читает только основной Document response текущей `/share/<id>` страницы и локально декодирует опубликованный snapshot из сериализованного React Router stream. ChatGPT authenticated thread 0.8.6 пассивно читает штатные JSON-страницы `/backend-api/conversations/<id>` / `.../messages?before=...`; локальное изменение позиции scroll-контейнера выполняется в `ISOLATED` content script только для того, чтобы интерфейс сам запросил предыдущую страницу. Transcript из DOM не извлекается.
 
 ## Passive/read-only policy
 
@@ -42,6 +42,12 @@ Grok и Claude получают данные из response body, который 
 В версии 0.8.1 полный HTML Document response public Shared используется только временно в памяти background extension environment. Parser извлекает из него `serverResponse.data.linear_conversation`, после чего в content runtime передается уже компактный normalized snapshot.
 
 Полный HTML body не записывается в technical log и больше не сохраняется автоматически отдельным diagnostic artifact. Request/response headers, cookies, Authorization и POST body для ChatGPT Shared не читаются и не добавляются в экспорт.
+
+## ChatGPT authenticated paginated JSON
+
+Для `/c/...` полный разговор может требовать нескольких штатных response body. Background хранит их только в памяти текущей capture-session до локального merge. Technical log получает URL/cursor IDs, размеры и счетчики, но не полный JSON body и не полный текст разговора.
+
+Расширение не отправляет `/backend-api/.../messages?before=` самостоятельно и не читает request/response headers, Cookie, Set-Cookie или Authorization. `before` cursor наблюдается только как часть URL уже выполненного самой страницей GET и используется для проверки целостности pagination-chain.
 
 ## Локальный кеш DeepSeek
 

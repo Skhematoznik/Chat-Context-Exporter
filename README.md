@@ -2,7 +2,7 @@
 
 **Chat Context Exporter** — локальное Chromium MV3-расширение для экспорта AI-диалогов в Markdown.
 
-Текущая версия: **0.8.1**.
+Текущая версия: **0.8.6**.
 
 ## Архитектура 0.8.x
 
@@ -41,7 +41,7 @@ DeepSeek 0.7.2 специально удаляет прежний MAIN-world Ind
 - **Claude — network adapter.** Полный conversation tree читается из `.../api/organizations/<org-id>/chat_conversations/<conversation-id>?tree=True&rendering_mode=messages...`.
 - **DeepSeek — reload + local-cache adapter.** При каждом запуске расширение сначала штатно перезагружает текущую страницу DeepSeek, ждет синхронизацию его локальной базы и затем read-only читает полную историю из `IndexedDB: deepseek-chat / history-message`, ключ — `chat_session_id`; DOM и scrolling не используются.
 - **ChatGPT Shared (`/share/...`) — passive network adapter.** После обычного reload захватывается только основной `GET /share/<id>` Document response. Опубликованный snapshot извлекается локально из сериализованного React Router stream внутри HTML; живой DOM/React state страницы не читается и page-world code не выполняется.
-- **ChatGPT authenticated thread (`/c/...`) — legacy DOM adapter.** Пока не мигрирован и функционально не менялся в 0.8.1.
+- **ChatGPT authenticated thread (`/c/...`) — passive network + isolated scroll pagination.** После reload расширение пассивно читает штатные JSON responses `backend-api/conversations/<id>`; если `page_info.has_previous_page=true`, `ISOLATED` content script выполняет обычные шаги прокрутки вверх, чтобы сам интерфейс ChatGPT запросил следующую страницу. Сообщения берутся из JSON, а не из DOM.
 
 После миграции сервиса его старый DOM-код удаляется; скрытый fallback не сохраняется.
 
@@ -125,6 +125,42 @@ Web citations из `content_references[type="grouped_webpages"]` преобра�
 
 Полный HTML response используется только в памяти background-процесса для локального parsing. В content runtime передается уже компактный normalized snapshot; полный Document body не записывается в technical log и автоматически не сохраняется отдельным diagnostic artifact.
 
+## ChatGPT authenticated thread — paginated passive network 0.8.6
+
+В 0.8.6 browser-level pagination ускорена специально для network thread: extension двигает reverse scroll-контейнер прямыми шагами примерно по 5 видимых окон (не менее 1200 px) вместо общего smooth-шага 0,7 окна. Настроенные задержки между действиями сохраняются; меняется только число локальных scroll-действий. Backend requests по-прежнему инициирует сам интерфейс ChatGPT.
+После фиксации ожидаемого `/messages?before=<cursor>` в passive Network capture расширение прекращает scroll-команды до обработки этого ответа, поэтому не создает серии бессмысленных `delta=0` у верхней границы текущей страницы.
+
+Обычный авторизованный `https://chatgpt.com/c/<conversation-id>` больше не использует DOM как источник transcript. DOM нужен только для поиска scroll-контейнера и обычной пользовательской прокрутки.
+
+Подтвержденный transport:
+
+```text
+user click
+→ chrome.debugger attach
+→ Network.enable
+→ ordinary reload
+→ ChatGPT itself GET /backend-api/conversations/<id>?num_turns=10...
+→ Network.getResponseBody
+→ JSON messages[] + page_info
+→ if has_previous_page=true:
+     ISOLATED content script scrolls upward with configured delay
+     ChatGPT itself GET .../messages?before=<start_cursor>&num_turns=10...
+     passive Network.getResponseBody
+     repeat
+→ has_previous_page=false
+→ local merge/dedup/validation
+→ Markdown
+→ detach
+```
+
+Расширение не строит и не отправляет `.../messages?before=...` самостоятельно. `start_cursor` используется только для проверки последовательности уже состоявшихся запросов ChatGPT: следующий штатный request должен содержать `before`, равный `start_cursor` предыдущей страницы.
+
+`page_info` является критерием полноты. Первая страница прохода должна иметь `has_next_page=false`, а последняя полученная страница — `has_previous_page=false`. На предоставленных JSON подтверждено, что `start_cursor` совпадает с первым `messages[].id`, а `end_cursor` — с последним.
+
+Каждая JSON-страница может содержать существенно больше внутренних raw messages, чем transcript turns: `system`, `tool`, `thoughts`, `reasoning_recap`, execution output и другие служебные записи отфильтровываются. Экспортируются только видимые `user` и видимые `assistant` с `recipient="all"` / `channel="final"`, по тому же контракту, что и Shared. Поддерживаются timestamps, `multimodal_text`, metadata вложений и `content_references`.
+
+Старая DOM extraction-реализация authenticated thread удалена; DOM fallback для `/c/...` не сохраняется.
+
 ## DeepSeek
 
 DeepSeek 0.7.2 больше не читает виртуализированный DOM. Экспериментально подтверждено, что штатный `history_messages` работает как синхронизация локального кеша:
@@ -175,13 +211,13 @@ reload
 
 Если второй проход содержит те же сообщения, они считаются дубликатами. Если он содержит ранее отсутствующие сообщения, они добавляются. Если тот же ID пришел в более полном состоянии, сохраненная версия может быть обновлена.
 
-Для DeepSeek каждый пользовательский запуск сначала делает один обязательный reload для синхронизации базы; дополнительный проход затем повторно читает `deepseek-chat / history-message` без еще одного reload и объединяет snapshots по `message_id`. Для ChatGPT Shared дополнительный проход означает еще один обычный reload и повторный passive capture полного Document snapshot; одинаковые message IDs учитываются как дубликаты, а для итогового экспорта выбирается наиболее свежий/полный валидный snapshot. Для legacy ChatGPT `/c/...` сохраняется текущая DOM-логика.
+Для DeepSeek каждый пользовательский запуск сначала делает один обязательный reload для синхронизации базы; дополнительный проход затем повторно читает `deepseek-chat / history-message` без еще одного reload и объединяет snapshots по `message_id`. Для ChatGPT Shared дополнительный проход означает еще один обычный reload и повторный passive capture полного Document snapshot. Для ChatGPT `/c/...` дополнительный проход повторяет полный цикл `reload → tail JSON → штатная scroll-pagination до has_previous_page=false`; одинаковые message IDs между проходами учитываются как дубликаты.
 
 ## Панель
 
 Панель выполнена в нейтральной dark-теме. Маджента используется в фирменной иконке, а не как основной цвет интерфейса.
 
-Поля контекстные. Для структурированных adapters Grok/Claude/DeepSeek/ChatGPT Shared показываются:
+Поля контекстные. Для full-snapshot adapters Grok/Claude/DeepSeek/ChatGPT Shared показываются:
 
 - чат;
 - текущий статус;
@@ -189,7 +225,7 @@ reload
 - число сообщений;
 - проход — только если включены дополнительные проходы.
 
-`Метод`, `Шаг` и `Позиция` не показываются, потому что эти адаптеры не используют scrolling. DeepSeek выполняет один reload в начале пользовательского запуска только для штатной синхронизации IndexedDB, после чего работает без прокрутки.
+`Метод`, `Шаг` и `Позиция` не показываются для full-snapshot adapters, потому что они не используют scrolling. ChatGPT `/c/...` показывает `Шаг` и `Позиция`, так как pagination штатно активируется обычной прокруткой вверх. DeepSeek выполняет один reload в начале пользовательского запуска только для штатной синхронизации IndexedDB, после чего работает без прокрутки.
 
 ## Markdown
 
@@ -213,9 +249,11 @@ reload
 
 Timestamp преобразуется в локальное время браузера. Роль выделяется жирным курсивом, дата — обычным курсивом на той же строке.
 
-Grok `message`, Claude `content[].text`, DeepSeek `REQUEST` / `RESPONSE` и ChatGPT Shared final text передаются как Markdown blocks без обратного преобразования через DOM. Для DeepSeek ссылки из `TOOL_OPEN`, которые однозначно сопоставляются с результатом поиска, восстанавливаются как Markdown links; неразрешимые `TOOL_SEARCH` reference-маркеры не выводятся. Для ChatGPT Shared web citations восстанавливаются из `content_references`, а внутренние file citations переводятся в переносимое текстовое обозначение источника.
+Grok `message`, Claude `content[].text`, DeepSeek `REQUEST` / `RESPONSE`, ChatGPT Shared и ChatGPT `/c/...` final text передаются как Markdown blocks без обратного преобразования через DOM. Для DeepSeek ссылки из `TOOL_OPEN`, которые однозначно сопоставляются с результатом поиска, восстанавливаются как Markdown links; неразрешимые `TOOL_SEARCH` reference-маркеры не выводятся. Для ChatGPT Shared web citations восстанавливаются из `content_references`, а внутренние file citations переводятся в переносимое текстовое обозначение источника.
 
-Имя файла строится из заголовка разговора/страницы и очищается от символов, запрещенных в Windows filenames. Для ChatGPT Shared используется `serverResponse.data.title`.
+Для ChatGPT финальные assistant-сообщения дополнительно повторяют presentation-порядок generated-file cards: самостоятельные ссылки `sandbox:/mnt/data/...` располагаются после обычного текста сообщения. Если карточка уже последняя, текст не меняется; обычные ссылки, citations и fenced code не переставляются.
+
+Имя файла строится из заголовка разговора/страницы и очищается от символов, запрещенных в Windows filenames. Для ChatGPT Shared используется `serverResponse.data.title`, для `/c/...` — `title` из initial conversation JSON.
 
 ## Логи
 
@@ -234,6 +272,8 @@ Network mode журналирует, в частности:
 
 Полный response body, полная IndexedDB-запись и полный текст разговора в технический лог не записываются. DeepSeek журналирует только метаданные cache/read, счетчики и validation statistics.
 
+Штатно перехваченные operational failures записываются в этот лог и показываются в собственной панели/странице настроек расширения, но не отправляются через `console.warn` / `console.error`. Console error оставлен только для необработанных или инфраструктурных сбоев загрузки runtime.
+
 ## Настройки
 
 Сохраняются:
@@ -246,7 +286,7 @@ Network mode журналирует, в частности:
 
 ## OpenAI / ChatGPT usage notice
 
-На момент выпуска 0.8.1 действующие OpenAI Terms of Use содержат запрет на автоматическое или программное извлечение данных или Output. Проект не трактует публичную доступность shared-link как автоматическое разрешение на программное извлечение и не пытается обходить это ограничение.
+На момент выпуска 0.8.2 действующие OpenAI Terms of Use содержат запрет на автоматическое или программное извлечение данных или Output. Проект не трактует публичную доступность shared-link как автоматическое разрешение на программное извлечение и не пытается обходить это ограничение.
 
 Официальная справка OpenAI одновременно указывает, что shared conversation из личного аккаунта может просматривать любой, у кого есть соответствующая ссылка; такая ссылка не дает доступ к аккаунту автора. Это описывает доступность опубликованного содержимого, но само по себе не отменяет ограничения Terms of Use на automated/programmatic extraction.
 
@@ -260,7 +300,7 @@ Chat Context Exporter спроектирован как локальный passi
 
 ## Permissions
 
-`manifest.json` 0.8.1 использует:
+`manifest.json` 0.8.6 использует:
 
 ```text
 activeTab
@@ -278,9 +318,9 @@ debugger
 assets/icons/                 используемые extension/UI icons
 src/background/               service worker, save channel, debugger transport, reload orchestration
 src/content/                  runtime orchestration
-src/core/                     settings/logger/save + DOM collector/scroller для еще не мигрированных сервисов
+src/core/                     settings/logger/save + generic DOM collector/scroller; scroller также используется как pagination trigger ChatGPT thread
 src/adapters/                 только реально подключенные adapters
-src/adapters/chatgpt/         Shared passive network profile + wire parser + legacy authenticated thread profile
+src/adapters/chatgpt/         Shared passive network + authenticated paginated-network profiles/parsers
 src/exporters/                Markdown exporter
 src/options/                  настройки
 src/ui/                       floating panel
@@ -288,12 +328,12 @@ src/ui/                       floating panel
 
 Template adapters, backup-копии и неиспользуемые future-заготовки в рабочем репозитории не хранятся.
 
-## Ограничения 0.8.1
+## Ограничения 0.8.6
 
 - ChatGPT Shared production parser подтвержден на трех public Shared fixtures текущего React Router wire-format; изменение серверной сериализации может потребовать обновления decoder.
 - ChatGPT Shared экспортирует metadata вложений, но не скачивает сами attachment bytes и не пытается превращать внутренние `sediment://`/file IDs в выдуманные внешние URL.
 - ChatGPT Shared file citations не имеют переносимого публичного URL; они сохраняются как текстовое имя источника и диапазон строк, когда такие metadata доступны.
-- Обычный авторизованный ChatGPT `/c/...` пока остается legacy DOM-profile и не относится к новому Shared network adapter.
+- ChatGPT `/c/...` зависит от текущего paginated JSON contract `messages[] + page_info` и от того, что штатный интерфейс инициирует предыдущую страницу при прокрутке вверх; изменение этого поведения может потребовать обновления adapter.
 - Claude `content` в предоставленном образце содержит только `type="text"`; неизвестные content types пока диагностируются, но не преобразуются в Markdown без реального образца их структуры.
 - Attachment metadata у Grok/Claude распознается и журналируется, но mapping вложений требует отдельных тестовых разговоров.
 - У DeepSeek прямые `TOOL_OPEN` references могут быть восстановлены в ссылки, если URL однозначно найден в соответствующем search fragment. Для `TOOL_SEARCH` references без однозначного URL внутренний marker не выводится и URL не выдумывается.

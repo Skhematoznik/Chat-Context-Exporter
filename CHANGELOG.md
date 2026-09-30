@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.8.6 — 2026-09-29
+
+- ChatGPT authenticated-thread pagination now pauses local scroll commands as soon as the expected `/messages?before=<cursor>` request is observed by passive CDP Network capture.
+- While that request is in flight, the content script polls capture state without issuing additional `scrollTop` changes; scrolling resumes only if the request disappears without advancing the page.
+- Added `CHATGPT_THREAD_PAGINATION_REQUEST_PENDING` / `..._RESOLVED` diagnostics for verifying the request-wait state machine.
+- Fast pagination geometry from 0.8.5 is unchanged: direct steps remain about five viewports (minimum 1200 px), and the extension still never creates its own ChatGPT backend pagination requests.
+
+## 0.8.5 — 2026-09-29
+
+Ускорена passive-network pagination авторизованных ChatGPT thread без изменения сетевого transport или parser.
+
+- только для `authenticated-thread` network pagination добавлен отдельный fast-scroll path: вместо общего `0.7 × clientHeight` + `smooth` используется прямой локальный шаг `5 × clientHeight`, минимум 1200 px;
+- fast-scroll применяется только как trigger штатной pagination интерфейса ChatGPT; расширение по-прежнему не создает собственные `/backend-api/.../messages` запросы и лишь пассивно читает ответы браузера через `chrome.debugger`;
+- пользовательские `minDelayMs/maxDelayMs` между scroll-действиями сохранены; ускорение достигается уменьшением числа действий, а не обходом настроенной задержки;
+- после каждого прямого шага оставлен короткий settle 120 ms для виртуализированного списка и scroll listeners, затем проверяется capture state;
+- технический лог получил `CHATGPT_THREAD_PAGINATION_SCROLL_MODE` с `stepViewports`, `stepPx` и `settleMs`; каждый `SCROLL_UP` сохраняет фактическую стратегию `direct-fast-pagination`;
+- обычный DOM scroller Grok/Claude/legacy paths и стандартные `scrollUpOneStep/scrollDownOneStep` не изменены;
+- generated-file-card normalization и operational-error policy 0.8.4 функционально не менялись.
+
+## 0.8.4 — 2026-09-29
+
+Исправлено представление созданных ChatGPT файлов в Markdown и отделены штатно обработанные операционные сбои от реальных ошибок расширения.
+
+- standalone Markdown-ссылки `sandbox:/mnt/data/...` в финальных assistant-сообщениях ChatGPT нормализуются в нижнюю часть сообщения, как файловые карточки в интерфейсе ChatGPT; порядок нескольких карточек сохраняется;
+- нормализация выполняется только после обработки `content_references`, поэтому исходные `start_idx/end_idx` не сдвигаются; обычные web/file citations, inline-ссылки и ссылки внутри fenced code не переставляются;
+- если generated-file card уже находится в конце сообщения, Markdown остается без изменений;
+- thread/shared diagnostics получили `generatedFileCards` и `generatedFileCardsMoved`;
+- перехваченные ошибки adapter/export/save/settings/options больше не отправляются через `console.warn` / `console.error`: они остаются в техническом логе и пользовательском UI/панели;
+- `console.error` сохранен для действительно необработанных или инфраструктурных сбоев: отсутствие core-модулей, ошибка инъекции content scripts и финальный `run().catch`;
+- paginated passive-network transport, cursor-chain validation и reverse-scroll pagination 0.8.3 функционально не менялись.
+
+## 0.8.3 — 2026-09-29
+
+Исправлено распознавание обычного авторизованного ChatGPT thread внутри вложенных маршрутов, включая Projects вида `/g/g-p-.../c/<conversation-id>` и другие ChatGPT URL, где сегмент `/c/<conversation-id>` не находится в корне pathname.
+
+- thread profile теперь определяется по конечному сегменту `/c/<conversation-id>`, а не только через `pathname.startsWith('/c/')`;
+- `conversation-id` извлекается из вложенного pathname;
+- Project thread больше не падает в legacy DOM fallback с `variant=unknown`, `acquisitionMode=dom` и `scrollMode=normal`;
+- после исправления используется тот же passive `chrome.debugger` Network transport и reverse-scroll pagination, что и для корневого `/c/...`;
+- network parser, cursor-chain validation и правила фильтрации transcript не менялись.
+
+## 0.8.2 — 2026-09-29
+
+Обычный авторизованный ChatGPT `/c/...` переведен с legacy DOM transcript extraction на paginated passive-network adapter.
+
+- initial tail загружается штатным `GET /backend-api/conversations/<conversation-id>?num_turns=10...` после обычного reload;
+- previous pages пассивно захватываются из штатных `.../messages?before=<cursor>&num_turns=10...`, которые инициирует сам интерфейс ChatGPT при обычной прокрутке вверх; расширение не создает эти backend-запросы самостоятельно;
+- `page_info.start_cursor/end_cursor/has_previous_page/has_next_page` используется как canonical pagination contract; completion наступает только при `has_previous_page=false`;
+- добавлен `src/adapters/chatgpt/thread-wire-parser.js`: JSON page локально фильтруется до visible user + assistant final, поддерживает timestamps, `multimodal_text`, attachment metadata и `content_references`;
+- cursor-chain валидируется: request `before` каждой следующей страницы должен совпасть с `start_cursor` предыдущей; первый response прохода обязан быть tail (`has_next_page=false`), последний — start (`has_previous_page=false`);
+- старый authenticated-thread DOM transcript parser полностью удален; DOM остается только для поиска scroll-контейнера и browser-level scroll в `ISOLATED` world;
+- network transport получил paginated state `awaiting-scroll`, page counters и технические события `CHATGPT_THREAD_PAGE_PARSED`, `CHATGPT_THREAD_PAGE_READY_FOR_SCROLL`, `CHATGPT_THREAD_START_REACHED`;
+- дополнительные проходы повторяют весь paginated cycle после reload и дедуплицируются по стабильным message IDs;
+- Grok, Claude, DeepSeek и ChatGPT Shared acquisition logic функционально не менялись.
+
 ## 0.8.1 — 2026-09-28
 
 ChatGPT Shared переведен с диагностического capture 0.8.0 на production passive-network adapter с локальным decoding опубликованного snapshot.

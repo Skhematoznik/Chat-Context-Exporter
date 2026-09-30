@@ -162,6 +162,8 @@
             multimodalUserMessages: stats.multimodalUserMessages ?? null,
             attachmentMessages: stats.attachmentMessages ?? null,
             attachmentCount: stats.attachmentCount ?? null,
+            generatedFileCards: stats.generatedFileCards ?? null,
+            generatedFileCardsMoved: stats.generatedFileCardsMoved ?? null,
             timestampedMessages: stats.timestampedMessages ?? null,
             missingTimestampMessages: stats.missingTimestampMessages ?? null,
           },

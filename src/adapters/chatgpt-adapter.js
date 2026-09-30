@@ -18,12 +18,16 @@
       || location.hostname === 'chat.openai.com';
   }
 
+  function isThreadPath() {
+    return /(?:^|\/)c\/[^/?#]+\/?$/i.test(location.pathname);
+  }
+
   function selectProfile() {
     if (location.pathname.startsWith('/share/')) {
       return profiles.shared;
     }
 
-    if (location.pathname.startsWith('/c/')) {
+    if (isThreadPath()) {
       return profiles.thread;
     }
 
@@ -63,7 +67,7 @@
       let score = 50;
       if (location.pathname.startsWith('/share/')) {
         score += 40;
-      } else if (location.pathname.startsWith('/c/')) {
+      } else if (isThreadPath()) {
         score += 25;
       }
       score += Math.min(40, Number(activeProfile?.detect?.()) || 0);

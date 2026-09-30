@@ -1,11 +1,16 @@
 importScripts('../adapters/chatgpt/shared-wire-parser.js');
+importScripts('../adapters/chatgpt/thread-wire-parser.js');
 
 'use strict';
 
 const chatGptShareWireParser = globalThis.__chatContextExporterShareWireParser;
+const chatGptThreadWireParser = globalThis.__chatContextExporterThreadWireParser;
 const CAPTURE_RESPONSE_PROCESSORS = Object.freeze({
   'chatgpt-shared-document': (body, session) => chatGptShareWireParser.parseDocumentBody(body, {
     expectedShareId: session.expectedShareId,
+  }),
+  'chatgpt-thread-json': (body, session) => chatGptThreadWireParser.parsePageBody(body, {
+    expectedConversationId: session.expectedConversationId,
   }),
 });
 
@@ -35,6 +40,8 @@ const CAPTURE_START_MESSAGE = 'chat-context-exporter:capture:start';
 const CAPTURE_GET_STATE_MESSAGE = 'chat-context-exporter:capture:get-state';
 const CAPTURE_CANCEL_MESSAGE = 'chat-context-exporter:capture:cancel';
 const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
+const CAPTURE_CONTINUE_MESSAGE = 'chat-context-exporter:capture:continue';
+const CAPTURE_SCROLL_STEP_MESSAGE = 'chat-context-exporter:capture:scroll-step';
 const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
 const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
 const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -83,6 +90,40 @@ function appendCaptureEvent(session, event, details = {}) {
   });
 }
 
+function getRequestBeforeCursor(url) {
+  try {
+    return new URL(url).searchParams.get('before');
+  } catch {
+    return null;
+  }
+}
+
+function getCurrentPaginationRequest(session) {
+  if (
+    !session
+    || session.paginationMode !== 'scroll-up-until-start'
+    || !session.pageState?.startCursor
+  ) {
+    return null;
+  }
+
+  const expectedBefore = session.pageState.startCursor;
+  let matched = null;
+  for (const requestInfo of session.pendingRequests.values()) {
+    if (getRequestBeforeCursor(requestInfo.url) !== expectedBefore) {
+      continue;
+    }
+    matched = {
+      requestId: requestInfo.requestId,
+      beforeCursor: expectedBefore,
+      pageSequence: session.pageState.pageSequence || null,
+      responseReceived: requestInfo.status !== null,
+      handled: Boolean(requestInfo.handled),
+    };
+  }
+  return matched;
+}
+
 function serializeCaptureSession(session, { includeCaptures = false } = {}) {
   if (!session) {
     return null;
@@ -99,6 +140,9 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
     extraPasses: Math.max(0, session.totalPasses - 1),
     capturesCompleted: session.captures.length,
     matchedRequests: session.matchedRequests,
+    paginationMode: session.paginationMode || null,
+    pageState: session.pageState ? { ...session.pageState } : null,
+    paginationRequest: getCurrentPaginationRequest(session),
     error: session.error || null,
     events: session.events.map((entry) => ({ ...entry })),
     captures: includeCaptures
@@ -169,7 +213,6 @@ function createSaveOperation(message) {
   })
     .then((downloadId) => ({ ok: true, downloadId }))
     .catch((error) => {
-      console.warn('Chat Context Exporter: не удалось сохранить файл.', error);
       return {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
@@ -271,6 +314,10 @@ async function beginCapturePass(session) {
   session.phase = 'capturing';
   session.error = null;
   session.currentPassCaptured = false;
+  session.pagesCapturedInPass = 0;
+  session.pageState = null;
+  session.seenPageStartCursors = new Set();
+  session.currentPassTranscriptIds = new Set();
   session.pendingRequests.clear();
   appendCaptureEvent(session, 'PASS_STARTED', {
     pass: session.pass,
@@ -332,7 +379,8 @@ async function completeCapturePass(session) {
 }
 
 async function captureResponseBody(session, requestId, requestInfo, params) {
-  if (!session || session.currentPassCaptured || requestInfo.handled) {
+  const paginated = session?.paginationMode === 'scroll-up-until-start';
+  if (!session || (!paginated && session.currentPassCaptured) || requestInfo.handled) {
     return;
   }
 
@@ -365,27 +413,113 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
       : null;
     if (responseProcessor) {
       processed = responseProcessor(body, session);
-      appendCaptureEvent(session, 'CHATGPT_SHARE_DOCUMENT_PARSED', {
-        pass: session.pass,
-        requestId,
-        wireFormat: processed?.transport?.wireFormat || null,
-        tableEntries: processed?.transport?.tableEntries ?? null,
-        rawNodes: processed?.rawNodes ?? null,
-        mappingNodes: processed?.mappingNodes ?? null,
-        uniqueRawNodeIds: processed?.uniqueRawNodeIds ?? null,
-        currentNodeMatchesLast: Boolean(processed?.currentNode && processed?.currentNode === processed?.lastNodeId),
-        messages: processed?.stats?.total ?? null,
-        user: processed?.stats?.user ?? null,
-        assistant: processed?.stats?.assistant ?? null,
-      });
+      if (session.responseProcessor === 'chatgpt-shared-document') {
+        appendCaptureEvent(session, 'CHATGPT_SHARE_DOCUMENT_PARSED', {
+          pass: session.pass,
+          requestId,
+          wireFormat: processed?.transport?.wireFormat || null,
+          tableEntries: processed?.transport?.tableEntries ?? null,
+          rawNodes: processed?.rawNodes ?? null,
+          mappingNodes: processed?.mappingNodes ?? null,
+          uniqueRawNodeIds: processed?.uniqueRawNodeIds ?? null,
+          currentNodeMatchesLast: Boolean(processed?.currentNode && processed?.currentNode === processed?.lastNodeId),
+          messages: processed?.stats?.total ?? null,
+          user: processed?.stats?.user ?? null,
+          assistant: processed?.stats?.assistant ?? null,
+          generatedFileCards: processed?.stats?.generatedFileCards ?? null,
+          generatedFileCardsMoved: processed?.stats?.generatedFileCardsMoved ?? null,
+        });
+      } else if (session.responseProcessor === 'chatgpt-thread-json') {
+        appendCaptureEvent(session, 'CHATGPT_THREAD_PAGE_PARSED', {
+          pass: session.pass,
+          requestId,
+          pageSequence: session.pagesCapturedInPass + 1,
+          rawMessages: processed?.rawMessages ?? null,
+          messages: processed?.stats?.total ?? null,
+          user: processed?.stats?.user ?? null,
+          assistant: processed?.stats?.assistant ?? null,
+          generatedFileCards: processed?.stats?.generatedFileCards ?? null,
+          generatedFileCardsMoved: processed?.stats?.generatedFileCardsMoved ?? null,
+          startCursor: processed?.pageInfo?.startCursor || null,
+          endCursor: processed?.pageInfo?.endCursor || null,
+          hasPreviousPage: processed?.pageInfo?.hasPreviousPage ?? null,
+          hasNextPage: processed?.pageInfo?.hasNextPage ?? null,
+        });
+      }
     }
 
-    session.currentPassCaptured = true;
+    const requestBefore = getRequestBeforeCursor(requestInfo.url);
+
+    let pageSequence = null;
+    if (paginated) {
+      pageSequence = session.pagesCapturedInPass + 1;
+      const pageInfo = processed?.pageInfo;
+      if (!pageInfo) {
+        throw new Error('Paginated capture processor не вернул pageInfo.');
+      }
+      if (pageSequence === 1) {
+        if (requestBefore) {
+          appendCaptureEvent(session, 'CHATGPT_THREAD_RESPONSE_SKIPPED', {
+            pass: session.pass,
+            requestId,
+            reason: 'before-cursor-before-tail',
+            requestBefore,
+          });
+          return;
+        }
+        if (pageInfo.hasNextPage !== false) {
+          appendCaptureEvent(session, 'CHATGPT_THREAD_RESPONSE_SKIPPED', {
+            pass: session.pass,
+            requestId,
+            reason: 'initial-response-not-tail',
+            startCursor: pageInfo.startCursor || null,
+            endCursor: pageInfo.endCursor || null,
+          });
+          return;
+        }
+      } else {
+        const expectedBefore = session.pageState?.startCursor || null;
+        if (!expectedBefore || requestBefore !== expectedBefore) {
+          appendCaptureEvent(session, 'CHATGPT_THREAD_RESPONSE_SKIPPED', {
+            pass: session.pass,
+            requestId,
+            reason: 'cursor-chain-mismatch',
+            requestBefore,
+            expectedBefore,
+          });
+          return;
+        }
+      }
+      if (pageInfo.startCursor && session.seenPageStartCursors.has(pageInfo.startCursor)) {
+        appendCaptureEvent(session, 'CHATGPT_THREAD_RESPONSE_SKIPPED', {
+          pass: session.pass,
+          requestId,
+          reason: 'duplicate-start-cursor',
+          startCursor: pageInfo.startCursor,
+        });
+        return;
+      }
+      if (pageInfo.startCursor) {
+        session.seenPageStartCursors.add(pageInfo.startCursor);
+      }
+      session.pagesCapturedInPass = pageSequence;
+      for (const message of processed.messages || []) {
+        if (typeof message?.id === 'string' && message.id) {
+          session.currentPassTranscriptIds.add(message.id);
+        }
+      }
+    } else {
+      session.currentPassCaptured = true;
+    }
+
     session.captures.push({
       pass: session.pass,
+      pageSequence,
       requestId,
+      requestBefore,
       url: requestInfo.url,
       method: requestInfo.method,
+      resourceType: requestInfo.resourceType || null,
       status: requestInfo.status ?? null,
       mimeType: requestInfo.mimeType ?? null,
       bodyBytes,
@@ -398,9 +532,11 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
     appendCaptureEvent(session, 'NETWORK_BODY_CAPTURED', {
       pass: session.pass,
       totalPasses: session.totalPasses,
+      pageSequence,
       requestId,
       url: requestInfo.url,
       method: requestInfo.method,
+      resourceType: requestInfo.resourceType || null,
       status: requestInfo.status ?? null,
       mimeType: requestInfo.mimeType ?? null,
       bodyBytes,
@@ -409,7 +545,50 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
         : null,
     });
 
-    await completeCapturePass(session);
+    if (paginated) {
+      const pageInfo = processed.pageInfo;
+      if (requestBefore) {
+        appendCaptureEvent(session, 'CHATGPT_THREAD_PAGINATION_REQUEST_RESOLVED', {
+          pass: session.pass,
+          pageSequence,
+          requestId,
+          beforeCursor: requestBefore,
+        });
+      }
+      session.pageState = {
+        pageSequence,
+        startCursor: pageInfo.startCursor || null,
+        endCursor: pageInfo.endCursor || null,
+        hasPreviousPage: pageInfo.hasPreviousPage === true,
+        hasNextPage: pageInfo.hasNextPage === true,
+        transcriptMessagesInPage: processed?.stats?.total ?? 0,
+        transcriptMessagesInPass: session.currentPassTranscriptIds.size,
+        rawMessagesInPage: processed?.rawMessages ?? 0,
+      };
+
+      if (pageInfo.hasPreviousPage === false) {
+        appendCaptureEvent(session, 'CHATGPT_THREAD_START_REACHED', {
+          pass: session.pass,
+          pageSequence,
+          startCursor: pageInfo.startCursor || null,
+          pagesCaptured: session.pagesCapturedInPass,
+          transcriptMessages: session.currentPassTranscriptIds.size,
+        });
+        await completeCapturePass(session);
+      } else {
+        clearCaptureTimer(session);
+        session.phase = 'awaiting-scroll';
+        appendCaptureEvent(session, 'CHATGPT_THREAD_PAGE_READY_FOR_SCROLL', {
+          pass: session.pass,
+          pageSequence,
+          startCursor: pageInfo.startCursor || null,
+          transcriptMessages: session.currentPassTranscriptIds.size,
+        });
+        await notifyCaptureSession(session);
+      }
+    } else {
+      await completeCapturePass(session);
+    }
   } catch (error) {
     appendCaptureEvent(session, 'NETWORK_BODY_CAPTURE_FAILED', {
       pass: session.pass,
@@ -449,6 +628,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       requestId: params.requestId,
       url,
       method: requestMethod || null,
+      resourceType: String(params?.type || '') || null,
       status: null,
       mimeType: null,
       handled: false,
@@ -458,12 +638,27 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       pass: session.pass,
       requestId: params.requestId,
       method: requestInfo.method,
+      resourceType: requestInfo.resourceType,
       url,
       postDataPresent: typeof params.request.postData === 'string' && params.request.postData.length > 0,
       postDataBytes: typeof params.request.postData === 'string'
         ? new TextEncoder().encode(params.request.postData).byteLength
         : 0,
     });
+
+    const requestBefore = getRequestBeforeCursor(url);
+    if (
+      session.paginationMode === 'scroll-up-until-start'
+      && requestBefore
+      && requestBefore === session.pageState?.startCursor
+    ) {
+      appendCaptureEvent(session, 'CHATGPT_THREAD_PAGINATION_REQUEST_PENDING', {
+        pass: session.pass,
+        pageSequence: session.pageState?.pageSequence || null,
+        requestId: params.requestId,
+        beforeCursor: requestBefore,
+      });
+    }
     return;
   }
 
@@ -566,6 +761,12 @@ async function startCaptureSession(tabId, message) {
     expectedShareId: typeof message.expectedShareId === 'string' && message.expectedShareId.trim()
       ? message.expectedShareId.trim()
       : null,
+    expectedConversationId: typeof message.expectedConversationId === 'string' && message.expectedConversationId.trim()
+      ? message.expectedConversationId.trim()
+      : null,
+    paginationMode: message.paginationMode === 'scroll-up-until-start'
+      ? 'scroll-up-until-start'
+      : null,
     startedAt: nowMs(),
     phase: 'attaching',
     pass: 0,
@@ -574,6 +775,10 @@ async function startCaptureSession(tabId, message) {
     maxDelayMs,
     timeoutMs,
     currentPassCaptured: false,
+    pagesCapturedInPass: 0,
+    pageState: null,
+    seenPageStartCursors: new Set(),
+    currentPassTranscriptIds: new Set(),
     matchedRequests: 0,
     captures: [],
     events: [],
@@ -616,6 +821,8 @@ async function startCaptureSession(tabId, message) {
     requestResourceType: session.requestResourceType,
     responseProcessor: session.responseProcessor,
     expectedShareId: session.expectedShareId,
+    expectedConversationId: session.expectedConversationId,
+    paginationMode: session.paginationMode,
     passive: true,
     pageExecution: false,
     ownNetworkRequests: false,
@@ -656,6 +863,58 @@ async function startCaptureSession(tabId, message) {
       state: serializeCaptureSession(session),
     };
   }
+}
+
+async function continueCaptureSession(tabId, message) {
+  const session = captureSessions.get(tabId);
+  if (!session) {
+    return { ok: false, error: 'Сессия сетевого захвата не найдена.' };
+  }
+  if (session.paginationMode !== 'scroll-up-until-start') {
+    return { ok: false, error: 'Текущий сетевой адаптер не использует scroll pagination.' };
+  }
+  if (session.phase !== 'awaiting-scroll') {
+    return { ok: true, state: serializeCaptureSession(session) };
+  }
+
+  session.phase = 'capturing';
+  session.pendingRequests.clear();
+  appendCaptureEvent(session, 'CHATGPT_THREAD_SCROLL_ARMED', {
+    pass: session.pass,
+    pageSequence: session.pageState?.pageSequence || null,
+    beforeCursor: session.pageState?.startCursor || null,
+    iteration: Number(message.iteration) || null,
+  });
+  scheduleCaptureTimeout(session);
+  await notifyCaptureSession(session);
+  return { ok: true, state: serializeCaptureSession(session) };
+}
+
+async function appendCaptureScrollStep(tabId, message) {
+  const session = captureSessions.get(tabId);
+  if (!session || session.paginationMode !== 'scroll-up-until-start') {
+    return { ok: true, state: serializeCaptureSession(session) };
+  }
+  appendCaptureEvent(session, 'SCROLL_UP', {
+    phase: 'network-pagination',
+    pass: session.pass,
+    totalPasses: session.totalPasses,
+    pageSequence: session.pageState?.pageSequence || null,
+    iteration: Number(message.iteration) || null,
+    step: Number(message.step) || null,
+    stepPx: Number.isFinite(Number(message.stepPx)) ? Number(message.stepPx) : null,
+    from: Number.isFinite(Number(message.from)) ? Math.round(Number(message.from)) : null,
+    target: Number.isFinite(Number(message.target)) ? Math.round(Number(message.target)) : null,
+    immediate: Number.isFinite(Number(message.immediate)) ? Math.round(Number(message.immediate)) : null,
+    strategy: typeof message.strategy === 'string' ? message.strategy : null,
+    delayMs: Number.isFinite(Number(message.delayMs)) ? Math.round(Number(message.delayMs)) : null,
+    actual: Number.isFinite(Number(message.actual)) ? Math.round(Number(message.actual)) : null,
+    delta: Number.isFinite(Number(message.delta)) ? Math.round(Number(message.delta)) : null,
+    moved: typeof message.moved === 'boolean' ? message.moved : null,
+    scrollHeight: Number.isFinite(Number(message.scrollHeight)) ? Math.round(Number(message.scrollHeight)) : null,
+    clientHeight: Number.isFinite(Number(message.clientHeight)) ? Math.round(Number(message.clientHeight)) : null,
+  });
+  return { ok: true, state: serializeCaptureSession(session) };
 }
 
 async function cancelCaptureSession(tabId) {
@@ -800,6 +1059,14 @@ async function handleCaptureMessage(message, sender) {
     };
   }
 
+  if (message.type === CAPTURE_CONTINUE_MESSAGE) {
+    return continueCaptureSession(tabId, message);
+  }
+
+  if (message.type === CAPTURE_SCROLL_STEP_MESSAGE) {
+    return appendCaptureScrollStep(tabId, message);
+  }
+
   if (message.type === CAPTURE_CANCEL_MESSAGE) {
     return cancelCaptureSession(tabId);
   }
@@ -841,7 +1108,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     operation
       .then((response) => sendResponse(response))
       .catch((error) => {
-        console.warn('Chat Context Exporter: ошибка канала сохранения.', error);
         sendResponse({
           ok: false,
           error: error instanceof Error ? error.message : String(error),
@@ -871,6 +1137,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (
     message.type === CAPTURE_START_MESSAGE
     || message.type === CAPTURE_GET_STATE_MESSAGE
+    || message.type === CAPTURE_CONTINUE_MESSAGE
+    || message.type === CAPTURE_SCROLL_STEP_MESSAGE
     || message.type === CAPTURE_CANCEL_MESSAGE
     || message.type === CAPTURE_RELEASE_MESSAGE
   ) {

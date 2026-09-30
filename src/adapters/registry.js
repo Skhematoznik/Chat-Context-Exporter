@@ -27,7 +27,6 @@
         try {
           score = Number(adapter.detect()) || 0;
         } catch (error) {
-          console.warn(`Chat Context Exporter: ошибка detect() адаптера ${adapter.id}.`, error);
         }
         return { adapter, score };
       })
