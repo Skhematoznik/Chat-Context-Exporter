@@ -119,6 +119,10 @@
     let attachmentCount = 0;
     let generatedFileCards = 0;
     let generatedFileCardsMoved = 0;
+    let targetedReplyEnvelopesNormalized = 0;
+    let assistantPreambleCandidates = 0;
+    let assistantPreambleFallbacksPageIncluded = 0;
+    let assistantPreamblesSuppressedByFinal = 0;
     let timestampedMessages = 0;
     let missingTimestampMessages = 0;
     const unsupportedContentTypes = new Set();
@@ -136,6 +140,10 @@
       attachmentCount += Number(page.stats?.attachmentCount) || 0;
       generatedFileCards += Number(page.stats?.generatedFileCards) || 0;
       generatedFileCardsMoved += Number(page.stats?.generatedFileCardsMoved) || 0;
+      targetedReplyEnvelopesNormalized += Number(page.stats?.targetedReplyEnvelopesNormalized) || 0;
+      assistantPreambleCandidates += Number(page.stats?.assistantPreambleCandidates) || 0;
+      assistantPreambleFallbacksPageIncluded += Number(page.stats?.assistantPreambleFallbacksIncluded) || 0;
+      assistantPreamblesSuppressedByFinal += Number(page.stats?.assistantPreamblesSuppressedByFinal) || 0;
       timestampedMessages += Number(page.stats?.timestampedMessages) || 0;
       missingTimestampMessages += Number(page.stats?.missingTimestampMessages) || 0;
       for (const contentType of page.stats?.unsupportedContentTypes || []) {
@@ -159,7 +167,34 @@
       }
     }
 
-    const messages = orderedIds.map((id) => byId.get(id).message);
+    const mergedMessages = orderedIds.map((id) => byId.get(id).message);
+    const finalTurnExchangeIds = new Set(
+      mergedMessages
+        .filter((message) => message?._chatgpt?.assistantVariant === 'final'
+          && typeof message?._chatgpt?.turnExchangeId === 'string'
+          && message._chatgpt.turnExchangeId)
+        .map((message) => message._chatgpt.turnExchangeId),
+    );
+    let crossPagePreamblesSuppressed = 0;
+    const resolvedMessages = mergedMessages.filter((message) => {
+      if (message?._chatgpt?.assistantVariant !== 'preamble-fallback') {
+        return true;
+      }
+      const exchangeId = message?._chatgpt?.turnExchangeId;
+      if (exchangeId && finalTurnExchangeIds.has(exchangeId)) {
+        crossPagePreamblesSuppressed += 1;
+        return false;
+      }
+      return true;
+    });
+    assistantPreamblesSuppressedByFinal += crossPagePreamblesSuppressed;
+    const assistantPreambleFallbacksIncluded = resolvedMessages.filter(
+      (message) => message?._chatgpt?.assistantVariant === 'preamble-fallback',
+    ).length;
+    const messages = resolvedMessages.map((message) => {
+      const { _chatgpt, ...clean } = message || {};
+      return clean;
+    });
     const user = messages.filter((message) => message.role === 'user').length;
     const assistant = messages.filter((message) => message.role === 'assistant').length;
     const metadataSource = pages.find((capture) => capture.processed.title || capture.processed.createTime)?.processed
@@ -196,6 +231,11 @@
         attachmentCount,
         generatedFileCards,
         generatedFileCardsMoved,
+        targetedReplyEnvelopesNormalized,
+        assistantPreambleCandidates,
+        assistantPreambleFallbacksPageIncluded,
+        assistantPreambleFallbacksIncluded,
+        assistantPreamblesSuppressedByFinal,
         timestampedMessages,
         missingTimestampMessages,
         references: aggregateReferenceStats(pages.map((capture) => capture.processed)),
@@ -295,6 +335,10 @@
             attachmentCount: stats.attachmentCount,
             generatedFileCards: stats.generatedFileCards,
             generatedFileCardsMoved: stats.generatedFileCardsMoved,
+            targetedReplyEnvelopesNormalized: stats.targetedReplyEnvelopesNormalized,
+            assistantPreambleCandidates: stats.assistantPreambleCandidates,
+            assistantPreambleFallbacksIncluded: stats.assistantPreambleFallbacksIncluded,
+            assistantPreamblesSuppressedByFinal: stats.assistantPreamblesSuppressedByFinal,
             timestampedMessages: stats.timestampedMessages,
             missingTimestampMessages: stats.missingTimestampMessages,
           },

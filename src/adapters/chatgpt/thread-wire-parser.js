@@ -299,20 +299,77 @@
     };
   }
 
+  function getTurnExchangeId(message) {
+    const metadata = message?.metadata && typeof message.metadata === 'object'
+      ? message.metadata
+      : {};
+    const turnExchangeId = typeof metadata.turn_exchange_id === 'string'
+      ? metadata.turn_exchange_id.trim()
+      : '';
+    if (turnExchangeId) {
+      return turnExchangeId;
+    }
+    const workingTurnId = typeof metadata.working_turn_id === 'string'
+      ? metadata.working_turn_id.trim()
+      : '';
+    return workingTurnId || null;
+  }
+
+  function isAssistantPreambleMessage(message) {
+    return message?.author?.role === 'assistant'
+      && message?.recipient === 'all'
+      && message?.channel === 'commentary'
+      && message?.metadata?.is_thinking_preamble_message === true;
+  }
+
+  function normalizeTargetedReplyEnvelope(markdown, metadata) {
+    const source = String(markdown || '').trim();
+    if (!source || typeof metadata?.targeted_reply_source_message_id !== 'string'
+        || !metadata.targeted_reply_source_message_id.trim()) {
+      return { markdown: source, normalized: false };
+    }
+
+    if (!/^# Selected text:\s*(?:\n|$)/i.test(source)) {
+      return { markdown: source, normalized: false };
+    }
+
+    const requestMarker = /(?:^|\n)## My request:\s*(?:\n|$)/i;
+    const match = requestMarker.exec(source);
+    if (!match) {
+      return { markdown: source, normalized: false };
+    }
+
+    const request = source.slice(match.index + match[0].length).trim();
+    if (request) {
+      return { markdown: request, normalized: true };
+    }
+
+    const dictated = typeof metadata?.dictation_original_text === 'string'
+      ? metadata.dictation_original_text.trim()
+      : '';
+    return dictated
+      ? { markdown: dictated, normalized: true }
+      : { markdown: source, normalized: false };
+  }
+
   function messageMarkdown(message) {
     const content = message?.content || {};
     const contentType = typeof content?.content_type === 'string' ? content.content_type : '';
     const baseText = extractTextParts(content);
     const rewritten = rewriteContentReferences(baseText, message?.metadata?.content_references);
+    const isUser = message?.author?.role === 'user' && message?.recipient === 'all';
+    const targetedReply = isUser
+      ? normalizeTargetedReplyEnvelope(rewritten.markdown, message?.metadata)
+      : { markdown: rewritten.markdown, normalized: false };
     const attachmentMarkdown = formatAttachmentList(message);
     const parts = [];
-    if (rewritten.markdown) parts.push(rewritten.markdown);
+    if (targetedReply.markdown) parts.push(targetedReply.markdown);
     if (attachmentMarkdown) parts.push(attachmentMarkdown);
     const combinedMarkdown = parts.join('\n\n').trim();
-    const isAssistantFinal = message?.author?.role === 'assistant'
+    const isAssistantVisible = message?.author?.role === 'assistant'
       && message?.recipient === 'all'
-      && message?.channel === 'final';
-    const generatedFiles = isAssistantFinal
+      && (message?.channel === 'final' || isAssistantPreambleMessage(message));
+    const generatedFiles = isAssistantVisible
       ? normalizeGeneratedFileCards(combinedMarkdown)
       : { markdown: combinedMarkdown, found: 0, moved: 0 };
     return {
@@ -324,6 +381,7 @@
         : 0,
       generatedFileCards: generatedFiles.found,
       generatedFileCardsMoved: generatedFiles.moved,
+      targetedReplyEnvelopeNormalized: targetedReply.normalized ? 1 : 0,
     };
   }
 
@@ -363,6 +421,20 @@
 
     const startCursor = typeof pageInfo.start_cursor === 'string' ? pageInfo.start_cursor : null;
     const endCursor = typeof pageInfo.end_cursor === 'string' ? pageInfo.end_cursor : null;
+    const finalAssistantTurnExchangeIds = new Set();
+    for (const candidate of rawMessages) {
+      if (candidate?.metadata?.is_visually_hidden_from_conversation === true) {
+        continue;
+      }
+      if (candidate?.author?.role === 'assistant'
+          && candidate?.recipient === 'all'
+          && candidate?.channel === 'final') {
+        const exchangeId = getTurnExchangeId(candidate);
+        if (exchangeId) {
+          finalAssistantTurnExchangeIds.add(exchangeId);
+        }
+      }
+    }
     if (rawMessages.length > 0) {
       const firstId = typeof rawMessages[0]?.id === 'string' ? rawMessages[0].id : null;
       const lastId = typeof rawMessages[rawMessages.length - 1]?.id === 'string'
@@ -386,6 +458,10 @@
     let attachmentCount = 0;
     let generatedFileCards = 0;
     let generatedFileCardsMoved = 0;
+    let targetedReplyEnvelopesNormalized = 0;
+    let assistantPreambleCandidates = 0;
+    let assistantPreambleFallbacksIncluded = 0;
+    let assistantPreamblesSuppressedByFinal = 0;
     let attachmentMessages = 0;
     let timestampedMessages = 0;
     let missingTimestampMessages = 0;
@@ -424,11 +500,24 @@
 
       const role = rawMessage?.author?.role;
       const recipient = rawMessage?.recipient;
+      const turnExchangeId = getTurnExchangeId(rawMessage);
       const isUser = role === 'user' && recipient === 'all';
       const isAssistantFinal = role === 'assistant' && recipient === 'all' && rawMessage?.channel === 'final';
-      if (!isUser && !isAssistantFinal) {
+      const isAssistantPreamble = isAssistantPreambleMessage(rawMessage);
+      if (isAssistantPreamble) {
+        assistantPreambleCandidates += 1;
+      }
+      const isAssistantPreambleFallback = isAssistantPreamble
+        && (!turnExchangeId || !finalAssistantTurnExchangeIds.has(turnExchangeId));
+      if (isAssistantPreamble && !isAssistantPreambleFallback) {
+        assistantPreamblesSuppressedByFinal += 1;
+      }
+      if (!isUser && !isAssistantFinal && !isAssistantPreambleFallback) {
         internalSkipped += 1;
         continue;
+      }
+      if (isAssistantPreambleFallback) {
+        assistantPreambleFallbacksIncluded += 1;
       }
 
       const contentType = typeof rawMessage?.content?.content_type === 'string'
@@ -458,18 +547,26 @@
       if (normalized.attachmentCount > 0) attachmentMessages += 1;
       generatedFileCards += normalized.generatedFileCards || 0;
       generatedFileCardsMoved += normalized.generatedFileCardsMoved || 0;
+      targetedReplyEnvelopesNormalized += normalized.targetedReplyEnvelopeNormalized || 0;
       if (isUser && contentType === 'multimodal_text') multimodalUserMessages += 1;
       for (const key of Object.keys(referenceTotals)) {
         referenceTotals[key] += normalized.referenceStats[key] || 0;
       }
 
       const normalizedRole = isUser ? 'user' : 'assistant';
-      messages.push({
+      const normalizedMessage = {
         id,
         role: normalizedRole,
         timestamp,
         blocks: [{ type: 'markdown', value: normalized.markdown }],
-      });
+      };
+      if (!isUser) {
+        normalizedMessage._chatgpt = {
+          turnExchangeId,
+          assistantVariant: isAssistantFinal ? 'final' : 'preamble-fallback',
+        };
+      }
+      messages.push(normalizedMessage);
       if (normalizedRole === 'user') user += 1;
       else assistant += 1;
     }
@@ -505,6 +602,10 @@
         attachmentMessages,
         generatedFileCards,
         generatedFileCardsMoved,
+        targetedReplyEnvelopesNormalized,
+        assistantPreambleCandidates,
+        assistantPreambleFallbacksIncluded,
+        assistantPreamblesSuppressedByFinal,
         timestampedMessages,
         missingTimestampMessages,
         references: referenceTotals,

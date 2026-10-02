@@ -2,7 +2,7 @@
 
 **Chat Context Exporter** — локальное Chromium MV3-расширение для экспорта AI-диалогов в Markdown.
 
-Текущая версия: **0.8.6**.
+Текущая версия: **0.8.7**.
 
 ## Архитектура 0.8.x
 
@@ -125,7 +125,9 @@ Web citations из `content_references[type="grouped_webpages"]` преобра�
 
 Полный HTML response используется только в памяти background-процесса для локального parsing. В content runtime передается уже компактный normalized snapshot; полный Document body не записывается в technical log и автоматически не сохраняется отдельным diagnostic artifact.
 
-## ChatGPT authenticated thread — paginated passive network 0.8.6
+## ChatGPT authenticated thread — paginated passive network 0.8.7
+
+В 0.8.7 добавлена transcript-normalization для presentation-only особенностей ChatGPT. Targeted reply с wire-envelope `# Selected text / ## My request` экспортирует только фактический пользовательский запрос. Видимый `is_thinking_preamble_message=true` / `channel=commentary` сохраняется только как fallback для незавершенного turn, если для того же `turn_exchange_id` нет обычного `channel=final`. UI-плашка о лимите обсуждения не является conversation message и не экспортируется.
 
 В 0.8.6 browser-level pagination ускорена специально для network thread: extension двигает reverse scroll-контейнер прямыми шагами примерно по 5 видимых окон (не менее 1200 px) вместо общего smooth-шага 0,7 окна. Настроенные задержки между действиями сохраняются; меняется только число локальных scroll-действий. Backend requests по-прежнему инициирует сам интерфейс ChatGPT.
 После фиксации ожидаемого `/messages?before=<cursor>` в passive Network capture расширение прекращает scroll-команды до обработки этого ответа, поэтому не создает серии бессмысленных `delta=0` у верхней границы текущей страницы.
@@ -300,7 +302,7 @@ Chat Context Exporter спроектирован как локальный passi
 
 ## Permissions
 
-`manifest.json` 0.8.6 использует:
+`manifest.json` 0.8.7 использует:
 
 ```text
 activeTab
@@ -328,7 +330,7 @@ src/ui/                       floating panel
 
 Template adapters, backup-копии и неиспользуемые future-заготовки в рабочем репозитории не хранятся.
 
-## Ограничения 0.8.6
+## Ограничения 0.8.7
 
 - ChatGPT Shared production parser подтвержден на трех public Shared fixtures текущего React Router wire-format; изменение серверной сериализации может потребовать обновления decoder.
 - ChatGPT Shared экспортирует metadata вложений, но не скачивает сами attachment bytes и не пытается превращать внутренние `sediment://`/file IDs в выдуманные внешние URL.

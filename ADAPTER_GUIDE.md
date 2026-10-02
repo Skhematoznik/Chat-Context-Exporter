@@ -83,7 +83,7 @@ Service-specific parser находится в `src/adapters/chatgpt/shared-wire-
 
 ## ChatGPT authenticated thread paginated network adapter
 
-Production 0.8.6 для ChatGPT thread URL с конечным сегментом `/c/<conversation-id>` использует гибридный transport: transcript читается только из штатных JSON responses, а `ISOLATED` content script локально изменяет позицию scroll-контейнера исключительно как trigger штатной pagination страницы.
+Production 0.8.7 для ChatGPT thread URL с конечным сегментом `/c/<conversation-id>` использует гибридный transport: transcript читается только из штатных JSON responses, а `ISOLATED` content script локально изменяет позицию scroll-контейнера исключительно как trigger штатной pagination страницы.
 
 В 0.8.6 этот trigger использует `direct-fast-pagination`: шаг равен примерно пяти высотам видимого scroll-контейнера (минимум 1200 px), после чего capture state проверяется снова. Это изменение не затрагивает wire parser и не превращает extension в инициатора backend pagination request.
 В 0.8.6 после обнаружения ожидаемого `/messages?before=<cursor>` дальнейшие scroll-команды блокируются до получения/обработки ответа; только затем разрешается следующий pagination trigger.
@@ -146,3 +146,8 @@ DOM остается fallback-классом только для сервисо�
 ## Репозиторий
 
 Не добавлять template adapters, backup-файлы или future-заготовки. Новый файл допустим, если он реально импортируется/используется runtime/build либо является необходимой project/GitHub документацией.
+
+
+### ChatGPT presentation normalization 0.8.7
+
+Для authenticated thread и shared snapshot targeted-reply wire envelope с `# Selected text` / `## My request` не считается буквальным текстом пользователя: при наличии `targeted_reply_source_message_id` экспортируется только фактическая часть `My request`. Видимый `is_thinking_preamble_message=true` с `channel=commentary` обычно является промежуточным сообщением и подавляется, если в том же `turn_exchange_id` существует `channel=final`; если final отсутствует из-за прерванного/исчерпанного turn, preamble сохраняется как fallback видимого ответа ассистента. UI-banner о лимите разговора не является transcript message и не экспортируется.

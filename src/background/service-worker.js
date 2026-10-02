@@ -428,6 +428,9 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
           assistant: processed?.stats?.assistant ?? null,
           generatedFileCards: processed?.stats?.generatedFileCards ?? null,
           generatedFileCardsMoved: processed?.stats?.generatedFileCardsMoved ?? null,
+          targetedReplyEnvelopesNormalized: processed?.stats?.targetedReplyEnvelopesNormalized ?? null,
+          assistantPreambleFallbacksIncluded: processed?.stats?.assistantPreambleFallbacksIncluded ?? null,
+          assistantPreamblesSuppressedByFinal: processed?.stats?.assistantPreamblesSuppressedByFinal ?? null,
         });
       } else if (session.responseProcessor === 'chatgpt-thread-json') {
         appendCaptureEvent(session, 'CHATGPT_THREAD_PAGE_PARSED', {
@@ -440,6 +443,9 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
           assistant: processed?.stats?.assistant ?? null,
           generatedFileCards: processed?.stats?.generatedFileCards ?? null,
           generatedFileCardsMoved: processed?.stats?.generatedFileCardsMoved ?? null,
+          targetedReplyEnvelopesNormalized: processed?.stats?.targetedReplyEnvelopesNormalized ?? null,
+          assistantPreambleFallbacksIncluded: processed?.stats?.assistantPreambleFallbacksIncluded ?? null,
+          assistantPreamblesSuppressedByFinal: processed?.stats?.assistantPreamblesSuppressedByFinal ?? null,
           startCursor: processed?.pageInfo?.startCursor || null,
           endCursor: processed?.pageInfo?.endCursor || null,
           hasPreviousPage: processed?.pageInfo?.hasPreviousPage ?? null,

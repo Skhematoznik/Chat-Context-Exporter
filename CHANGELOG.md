@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.7 — 2026-10-02
+
+- ChatGPT targeted replies больше не экспортируют служебный wire-envelope `Selected text / Selection / My request` внутрь пользовательского сообщения; сохраняется фактический `My request`.
+- Добавлен fallback для незавершенного assistant turn: видимый `is_thinking_preamble_message=true` / `channel=commentary` экспортируется только если для того же turn отсутствует обычный `channel=final`.
+- Для paginated thread fallback дополнительно разрешается на уровне полного pass snapshot, поэтому final на соседней JSON-странице подавляет provisional preamble и не создает дубль.
+- Добавлена диагностика `targetedReplyEnvelopesNormalized`, `assistantPreambleCandidates`, `assistantPreambleFallbacksIncluded`, `assistantPreamblesSuppressedByFinal`.
+- Сетевой capture, fast pagination 0.8.5, request-wait state machine 0.8.6 и generated-file-card normalization 0.8.4 не изменялись.
+
 ## 0.8.6 — 2026-09-29
 
 - ChatGPT authenticated-thread pagination now pauses local scroll commands as soon as the expected `/messages?before=<cursor>` request is observed by passive CDP Network capture.

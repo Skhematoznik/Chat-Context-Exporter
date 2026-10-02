@@ -5,14 +5,14 @@
   const existing = globalThis[ROOT_KEY];
 
   if (existing && typeof existing === 'object') {
-    existing.version = '0.8.6';
+    existing.version = '0.8.7';
     existing.modules ||= Object.create(null);
     existing.adapters ||= [];
     return;
   }
 
   globalThis[ROOT_KEY] = {
-    version: '0.8.6',
+    version: '0.8.7',
     modules: Object.create(null),
     adapters: [],
   };
