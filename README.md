@@ -2,7 +2,7 @@
 
 **Chat Context Exporter** — локальное Chromium MV3-расширение для экспорта AI-диалогов в Markdown.
 
-Текущая версия: **0.8.8**.
+Текущая версия: **0.8.8.1**.
 
 ## Архитектура 0.8.x
 
@@ -128,6 +128,8 @@ Web citations из `content_references[type="grouped_webpages"]` преобра�
 ## ChatGPT authenticated thread — paginated passive network 0.8.8
 
 В 0.8.8 для состояния `conversation limit reached` добавлен отдельный presentation-safety contract. До первого reload extension ищет limit-banner в live DOM и, если он присутствует, сохраняет последний видимый `User → Assistant` tail. Последний user используется как anchor, а последний `assistant-message` с `data-markdown-text-tone="primary"` немедленно сериализуется в Markdown и сохраняется в extension-owned `chrome.storage.session`. Пока snapshot не сохранен надежно, reload не разрешается.
+
+В 0.8.8.1 capture поддерживает также attachment-only user turns без `data-user-message-bubble`: anchor берется из semantic search unit `...:user`. Для Work/agent UI assistant может не иметь `data-markdown-text-tone="primary"`; тогда используется assistant-scoped `data-markdown-text-style="assistant-message"`.
 
 После passive-network pagination этот pre-reload DOM assistant считается authoritative presentation truth для последнего turn: любой post-reload network assistant после совпавшего последнего user anchor — полный, частичный, изменившийся или отсутствующий — заменяется сохраненным DOM snapshot. Сама плашка лимита в Markdown не экспортируется. Shared ChatGPT этим механизмом не затрагивается.
 
@@ -307,7 +309,7 @@ Chat Context Exporter спроектирован как локальный passi
 
 ## Permissions
 
-`manifest.json` 0.8.8 использует:
+`manifest.json` 0.8.8.1 использует:
 
 ```text
 activeTab
@@ -335,7 +337,7 @@ src/ui/                       floating panel
 
 Template adapters, backup-копии и неиспользуемые future-заготовки в рабочем репозитории не хранятся.
 
-## Ограничения 0.8.8
+## Ограничения 0.8.8.1
 
 - ChatGPT Shared production parser подтвержден на трех public Shared fixtures текущего React Router wire-format; изменение серверной сериализации может потребовать обновления decoder.
 - ChatGPT Shared экспортирует metadata вложений, но не скачивает сами attachment bytes и не пытается превращать внутренние `sediment://`/file IDs в выдуманные внешние URL.

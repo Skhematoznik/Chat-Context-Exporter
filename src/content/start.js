@@ -2029,9 +2029,11 @@
       userTurnKey: snapshot.user?.turnKey || null,
       userChars: snapshot.user?.markdown?.length || 0,
       userHash: snapshot.user?.hash || null,
+      userCaptureMode: snapshot.user?.captureMode || null,
       assistantChars: snapshot.assistant?.markdown?.length || 0,
       assistantHash: snapshot.assistant?.hash || null,
       assistantPrimaryCandidates: snapshot.assistant?.primaryCandidates || null,
+      assistantCaptureMode: snapshot.assistant?.captureMode || null,
       authoritative: snapshot.authoritative === true,
     });
     return snapshot;

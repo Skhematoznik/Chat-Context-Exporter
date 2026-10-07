@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.8.1 — 2026-10-08
+
+- Исправлен pre-reload conversation-limit snapshot, когда последнее user-сообщение состоит только из прикрепленного файла и не имеет `[data-user-message-bubble="true"]`.
+- User anchor теперь ищется сначала как обычный bubble, затем как semantic search unit `...:user`; message ID берется только из user-scoped `data-chatgpt-search-message-ids`.
+- Поддержан текущий Work/agent DOM, где финальный assistant block имеет `data-markdown-text-style="assistant-message"`, но может не иметь `data-markdown-text-tone="primary"`; при отсутствии tone используется assistant-scoped search unit.
+- Reconciliation получил дополнительный fallback по `turnKey`, что важно для attachment-only user turns, где текстовое сопоставление нестабильно.
+- В diagnostics добавлены `userCaptureMode` и `assistantCaptureMode`. Пагинация, passive-network transport и authoritative DOM-tail semantics 0.8.8 не изменялись.
+
 ## 0.8.8 — 2026-10-07
 
 - Для обычного authenticated ChatGPT thread добавлен pre-reload snapshot последнего видимого `User → Assistant` tail, когда в live DOM присутствует плашка о максимальной длине обсуждения.

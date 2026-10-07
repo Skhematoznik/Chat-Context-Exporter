@@ -961,9 +961,11 @@ async function startCaptureSession(tabId, message) {
       userTurnKey: preReloadTailSnapshot.user?.turnKey || null,
       userChars: preReloadTailSnapshot.user?.markdown?.length || 0,
       userHash: preReloadTailSnapshot.user?.hash || null,
+      userCaptureMode: preReloadTailSnapshot.user?.captureMode || null,
       assistantChars: preReloadTailSnapshot.assistant?.markdown?.length || 0,
       assistantHash: preReloadTailSnapshot.assistant?.hash || null,
       assistantPrimaryCandidates: preReloadTailSnapshot.assistant?.primaryCandidates || null,
+      assistantCaptureMode: preReloadTailSnapshot.assistant?.captureMode || null,
       authoritative: true,
       storage: 'chrome.storage.session',
     });

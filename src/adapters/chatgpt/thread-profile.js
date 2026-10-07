@@ -99,11 +99,68 @@
     return markdownExporter.renderBlocks(blocks).trim();
   }
 
-  function resolveUserMessageId(turn, userBubble) {
+  function isSearchUnitRole(element, role) {
+    if (!(element instanceof HTMLElement)) {
+      return false;
+    }
+    const keys = [
+      element.getAttribute('data-chatgpt-search-unit-key'),
+      element.getAttribute('data-content-search-unit-key'),
+    ];
+    return keys.some((key) => typeof key === 'string' && key.toLowerCase().endsWith(`:${role}`));
+  }
+
+  function findLastUserPresentationRoot(turn) {
+    const bubble = turn.querySelector('[data-user-message-bubble="true"]');
+    if (bubble instanceof HTMLElement) {
+      return { element: bubble, mode: 'user-message-bubble' };
+    }
+
+    const candidates = [...turn.querySelectorAll(
+      '[data-chatgpt-search-unit-key], [data-content-search-unit-key]',
+    )].filter((element) => (
+      element instanceof HTMLElement
+      && isSearchUnitRole(element, 'user')
+      && (normalizeDomText(element.textContent) || element.querySelector('[data-file-reference="true"], img, video'))
+    ));
+    const element = candidates[candidates.length - 1] || null;
+    return element instanceof HTMLElement
+      ? { element, mode: 'search-unit-user' }
+      : null;
+  }
+
+  function findAssistantPresentationRoots(turn, userRoot) {
+    const candidates = [...turn.querySelectorAll('[data-markdown-text-style="assistant-message"]')]
+      .filter((element) => (
+        element instanceof HTMLElement
+        && !userRoot?.contains?.(element)
+        && !element.closest('[data-markdown-copy="exclude"]')
+        && normalizeDomText(element.textContent)
+      ));
+    const primary = candidates.filter((element) => (
+      element.getAttribute('data-markdown-text-tone') === 'primary'
+    ));
+    if (primary.length) {
+      return { roots: primary, mode: 'tone-primary' };
+    }
+
+    const assistantScoped = candidates.filter((element) => {
+      const unit = element.closest('[data-chatgpt-search-unit-key], [data-content-search-unit-key]');
+      return isSearchUnitRole(unit, 'assistant');
+    });
+    if (assistantScoped.length) {
+      return { roots: assistantScoped, mode: 'search-unit-assistant' };
+    }
+
+    return { roots: candidates, mode: candidates.length ? 'assistant-style-fallback' : 'none' };
+  }
+
+  function resolveUserMessageId(turn, userRoot) {
     const candidates = [
-      userBubble?.closest?.('[data-chatgpt-search-message-ids]'),
-      userBubble?.querySelector?.('[data-chatgpt-search-message-ids]'),
-      turn?.querySelector?.('[data-chatgpt-search-message-ids]'),
+      userRoot?.closest?.('[data-chatgpt-search-message-ids]'),
+      userRoot?.querySelector?.('[data-chatgpt-search-message-ids]'),
+      turn?.querySelector?.('[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]'),
+      turn?.querySelector?.('[data-content-search-unit-key$=":user"][data-chatgpt-search-message-ids]'),
     ];
 
     for (const candidate of candidates) {
@@ -136,33 +193,29 @@
       throw new Error('ChatGPT Thread: обнаружена плашка лимита, но последний turn не найден. Перезагрузка отменена.');
     }
 
-    const userBubble = turn.querySelector('[data-user-message-bubble="true"]');
-    if (!(userBubble instanceof HTMLElement)) {
+    const userPresentation = findLastUserPresentationRoot(turn);
+    const userRoot = userPresentation?.element || null;
+    if (!(userRoot instanceof HTMLElement)) {
       throw new Error('ChatGPT Thread: обнаружена плашка лимита, но последнее сообщение пользователя не найдено. Перезагрузка отменена.');
     }
 
-    const assistantRoots = [...turn.querySelectorAll(
-      '[data-markdown-text-style="assistant-message"][data-markdown-text-tone="primary"]',
-    )].filter((element) => (
-      element instanceof HTMLElement
-      && !element.closest('[data-user-message-bubble="true"]')
-      && normalizeDomText(element.textContent)
-    ));
+    const assistantPresentation = findAssistantPresentationRoots(turn, userRoot);
+    const assistantRoots = assistantPresentation.roots;
     const assistantRoot = assistantRoots[assistantRoots.length - 1] || null;
     if (!(assistantRoot instanceof HTMLElement)) {
       throw new Error('ChatGPT Thread: обнаружена плашка лимита, но последний видимый ответ ассистента не найден. Перезагрузка отменена.');
     }
 
-    const userMarkdown = renderDomElementMarkdown(userBubble);
+    const userMarkdown = renderDomElementMarkdown(userRoot);
     const assistantMarkdown = renderDomElementMarkdown(assistantRoot);
-    const userText = normalizeDomText(userBubble.textContent);
+    const userText = normalizeDomText(userRoot.textContent);
     const assistantText = normalizeDomText(assistantRoot.textContent);
     if (!userMarkdown || !userText || !assistantMarkdown || !assistantText) {
       throw new Error('ChatGPT Thread: плашка лимита найдена, но DOM-tail не удалось сериализовать полностью. Перезагрузка отменена.');
     }
 
     const turnKey = normalizeDomText(turn.getAttribute('data-turn-key')) || null;
-    const userMessageId = resolveUserMessageId(turn, userBubble);
+    const userMessageId = resolveUserMessageId(turn, userRoot);
     return {
       schemaVersion: 1,
       source: 'pre-reload-limit-dom',
@@ -176,12 +229,14 @@
         markdown: userMarkdown,
         normalizedText: userText,
         hash: hashString(userText),
+        captureMode: userPresentation.mode,
       },
       assistant: {
         markdown: assistantMarkdown,
         normalizedText: assistantText,
         hash: hashString(assistantMarkdown),
         primaryCandidates: assistantRoots.length,
+        captureMode: assistantPresentation.mode,
       },
     };
   }
@@ -247,6 +302,18 @@
       anchorIndex = messages.findIndex((message) => message?.role === 'user' && message?.id === expectedUserId);
       if (anchorIndex >= 0) {
         diagnostics.matchMethod = 'message-id';
+      }
+    }
+
+    if (anchorIndex < 0) {
+      const expectedTurnKey = typeof tail?.user?.turnKey === 'string' && tail.user.turnKey.trim()
+        ? tail.user.turnKey.trim()
+        : null;
+      if (expectedTurnKey) {
+        anchorIndex = messages.findIndex((message) => message?.role === 'user' && message?.id === expectedTurnKey);
+        if (anchorIndex >= 0) {
+          diagnostics.matchMethod = 'turn-key';
+        }
       }
     }
 
