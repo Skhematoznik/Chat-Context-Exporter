@@ -47,6 +47,291 @@
     };
   }
 
+  const LIMIT_ALERT_PATTERNS = Object.freeze([
+    /достигли максимальной длины (?:этого )?обсуждения/i,
+    /reached (?:the )?maximum length (?:for|of) (?:this|the) (?:conversation|discussion)/i,
+  ]);
+
+  function normalizeDomText(value) {
+    return String(value ?? '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[\u200b-\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function hashString(value) {
+    let hash = 2166136261;
+    const text = String(value ?? '');
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+  }
+
+  function findConversationLimitAlert() {
+    const alerts = [...document.querySelectorAll('aside[role="alert"]')];
+    for (let index = alerts.length - 1; index >= 0; index -= 1) {
+      const alert = alerts[index];
+      const text = normalizeDomText(alert.textContent);
+      if (text && LIMIT_ALERT_PATTERNS.some((pattern) => pattern.test(text))) {
+        return alert;
+      }
+    }
+    return null;
+  }
+
+  function renderDomElementMarkdown(element) {
+    const richTextParser = app.modules.richTextParser;
+    const markdownExporter = app.modules.markdownExporter;
+    if (!richTextParser?.parseHtml || !markdownExporter?.renderBlocks) {
+      throw new Error('ChatGPT Thread: DOM Markdown serializer недоступен.');
+    }
+
+    const clone = element.cloneNode(true);
+    for (const excluded of clone.querySelectorAll('[data-markdown-copy="exclude"]')) {
+      excluded.remove();
+    }
+    const blocks = richTextParser.parseHtml(clone.innerHTML, {
+      baseUrl: window.location.href,
+    });
+    return markdownExporter.renderBlocks(blocks).trim();
+  }
+
+  function resolveUserMessageId(turn, userBubble) {
+    const candidates = [
+      userBubble?.closest?.('[data-chatgpt-search-message-ids]'),
+      userBubble?.querySelector?.('[data-chatgpt-search-message-ids]'),
+      turn?.querySelector?.('[data-chatgpt-search-message-ids]'),
+    ];
+
+    for (const candidate of candidates) {
+      const raw = candidate?.getAttribute?.('data-chatgpt-search-message-ids');
+      if (!raw) {
+        continue;
+      }
+      const first = raw.split(/[\s,]+/).map((item) => item.trim()).find(Boolean);
+      if (first) {
+        return first;
+      }
+    }
+    return null;
+  }
+
+  function capturePreReloadTailSnapshot() {
+    const limitAlert = findConversationLimitAlert();
+    if (!limitAlert) {
+      return null;
+    }
+
+    const conversationId = getConversationId();
+    if (!conversationId) {
+      throw new Error('ChatGPT Thread: обнаружена плашка лимита, но conversation id не определен. Перезагрузка отменена.');
+    }
+
+    const turns = [...document.querySelectorAll('[data-turn-key]')];
+    const turn = limitAlert.closest('[data-turn-key]') || turns[turns.length - 1] || null;
+    if (!(turn instanceof HTMLElement)) {
+      throw new Error('ChatGPT Thread: обнаружена плашка лимита, но последний turn не найден. Перезагрузка отменена.');
+    }
+
+    const userBubble = turn.querySelector('[data-user-message-bubble="true"]');
+    if (!(userBubble instanceof HTMLElement)) {
+      throw new Error('ChatGPT Thread: обнаружена плашка лимита, но последнее сообщение пользователя не найдено. Перезагрузка отменена.');
+    }
+
+    const assistantRoots = [...turn.querySelectorAll(
+      '[data-markdown-text-style="assistant-message"][data-markdown-text-tone="primary"]',
+    )].filter((element) => (
+      element instanceof HTMLElement
+      && !element.closest('[data-user-message-bubble="true"]')
+      && normalizeDomText(element.textContent)
+    ));
+    const assistantRoot = assistantRoots[assistantRoots.length - 1] || null;
+    if (!(assistantRoot instanceof HTMLElement)) {
+      throw new Error('ChatGPT Thread: обнаружена плашка лимита, но последний видимый ответ ассистента не найден. Перезагрузка отменена.');
+    }
+
+    const userMarkdown = renderDomElementMarkdown(userBubble);
+    const assistantMarkdown = renderDomElementMarkdown(assistantRoot);
+    const userText = normalizeDomText(userBubble.textContent);
+    const assistantText = normalizeDomText(assistantRoot.textContent);
+    if (!userMarkdown || !userText || !assistantMarkdown || !assistantText) {
+      throw new Error('ChatGPT Thread: плашка лимита найдена, но DOM-tail не удалось сериализовать полностью. Перезагрузка отменена.');
+    }
+
+    const turnKey = normalizeDomText(turn.getAttribute('data-turn-key')) || null;
+    const userMessageId = resolveUserMessageId(turn, userBubble);
+    return {
+      schemaVersion: 1,
+      source: 'pre-reload-limit-dom',
+      reason: 'conversation-limit',
+      authoritative: true,
+      conversationId,
+      capturedAt: new Date().toISOString(),
+      user: {
+        turnKey,
+        messageId: userMessageId,
+        markdown: userMarkdown,
+        normalizedText: userText,
+        hash: hashString(userText),
+      },
+      assistant: {
+        markdown: assistantMarkdown,
+        normalizedText: assistantText,
+        hash: hashString(assistantMarkdown),
+        primaryCandidates: assistantRoots.length,
+      },
+    };
+  }
+
+  function messageMarkdownText(message) {
+    return (Array.isArray(message?.blocks) ? message.blocks : [])
+      .map((block) => block?.type === 'markdown' ? String(block.value || '') : '')
+      .filter(Boolean)
+      .join('\n\n')
+      .trim();
+  }
+
+  function normalizeAnchorMarkdown(value) {
+    return normalizeDomText(String(value ?? '')
+      .replace(/\\([\\`*_\[\]<>~#+.!-])/g, '$1'));
+  }
+
+  function applyPreReloadTailOverride(snapshot, preReloadTailSnapshot) {
+    const tail = preReloadTailSnapshot && typeof preReloadTailSnapshot === 'object'
+      ? preReloadTailSnapshot
+      : null;
+    const diagnostics = {
+      captured: Boolean(tail),
+      userMatched: false,
+      matchMethod: null,
+      applied: false,
+      reason: tail ? 'not-matched' : 'not-captured',
+      networkAssistantMessagesRemoved: 0,
+      networkAssistantChars: 0,
+      domAssistantChars: tail?.assistant?.markdown?.length || 0,
+      domAssistantHash: tail?.assistant?.hash || null,
+    };
+
+    if (!tail) {
+      return { snapshot, diagnostics };
+    }
+    if (tail.authoritative !== true || tail.reason !== 'conversation-limit') {
+      diagnostics.reason = 'invalid-tail-contract';
+      return { snapshot, diagnostics };
+    }
+    if (tail.conversationId && snapshot.conversationId && tail.conversationId !== snapshot.conversationId) {
+      diagnostics.reason = 'conversation-mismatch';
+      return { snapshot, diagnostics };
+    }
+    const domAssistantMarkdown = String(tail?.assistant?.markdown || '').trim();
+    if (!domAssistantMarkdown) {
+      diagnostics.reason = 'empty-dom-assistant';
+      return { snapshot, diagnostics };
+    }
+
+    const messages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
+    const lastUserIndex = messages.findLastIndex((message) => message?.role === 'user');
+    if (lastUserIndex < 0) {
+      diagnostics.reason = 'network-user-missing';
+      return { snapshot, diagnostics };
+    }
+
+    const expectedUserId = typeof tail?.user?.messageId === 'string' && tail.user.messageId.trim()
+      ? tail.user.messageId.trim()
+      : null;
+    let anchorIndex = -1;
+    if (expectedUserId) {
+      anchorIndex = messages.findIndex((message) => message?.role === 'user' && message?.id === expectedUserId);
+      if (anchorIndex >= 0) {
+        diagnostics.matchMethod = 'message-id';
+      }
+    }
+
+    if (anchorIndex < 0) {
+      const expectedText = normalizeAnchorMarkdown(tail?.user?.markdown || tail?.user?.normalizedText || '');
+      if (expectedText) {
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          const message = messages[index];
+          if (message?.role !== 'user') {
+            continue;
+          }
+          if (normalizeAnchorMarkdown(messageMarkdownText(message)) === expectedText) {
+            anchorIndex = index;
+            diagnostics.matchMethod = 'normalized-user-text';
+            break;
+          }
+        }
+      }
+    }
+
+    if (anchorIndex < 0) {
+      diagnostics.reason = 'user-anchor-not-found';
+      return { snapshot, diagnostics };
+    }
+    if (anchorIndex !== lastUserIndex) {
+      diagnostics.reason = 'user-anchor-is-not-last-user';
+      return { snapshot, diagnostics };
+    }
+
+    diagnostics.userMatched = true;
+    const tailMessages = messages.slice(anchorIndex + 1);
+    if (tailMessages.some((message) => message?.role === 'user')) {
+      diagnostics.reason = 'unexpected-user-after-anchor';
+      return { snapshot, diagnostics };
+    }
+
+    const removedAssistants = tailMessages.filter((message) => message?.role === 'assistant');
+    diagnostics.networkAssistantMessagesRemoved = removedAssistants.length;
+    diagnostics.networkAssistantChars = removedAssistants.reduce(
+      (sum, message) => sum + messageMarkdownText(message).length,
+      0,
+    );
+    const preservedTimestamp = [...removedAssistants]
+      .reverse()
+      .map((message) => message?.timestamp || null)
+      .find(Boolean) || null;
+    const anchorMessage = messages[anchorIndex];
+    const assistantIdBase = expectedUserId || tail?.user?.turnKey || anchorMessage?.id || 'tail';
+    const domAssistantMessage = {
+      id: `dom-tail:${assistantIdBase}`,
+      role: 'assistant',
+      timestamp: preservedTimestamp,
+      blocks: [{ type: 'markdown', value: domAssistantMarkdown }],
+    };
+    const resolvedMessages = [
+      ...messages.slice(0, anchorIndex + 1),
+      domAssistantMessage,
+    ];
+    const stats = {
+      ...(snapshot.stats || {}),
+      total: resolvedMessages.length,
+      user: resolvedMessages.filter((message) => message.role === 'user').length,
+      assistant: resolvedMessages.filter((message) => message.role === 'assistant').length,
+      other: 0,
+      timestampedMessages: resolvedMessages.filter((message) => Boolean(message.timestamp)).length,
+      missingTimestampMessages: resolvedMessages.filter((message) => !message.timestamp).length,
+      limitTailCaptured: true,
+      limitTailUserMatched: true,
+      limitTailMatchMethod: diagnostics.matchMethod,
+      networkTailAssistantMessagesRemoved: diagnostics.networkAssistantMessagesRemoved,
+      domTailAssistantApplied: true,
+    };
+
+    diagnostics.applied = true;
+    diagnostics.reason = 'authoritative-dom-tail';
+    return {
+      snapshot: {
+        ...snapshot,
+        messages: resolvedMessages,
+        stats,
+      },
+      diagnostics,
+    };
+  }
+
   function messageFingerprint(message) {
     return JSON.stringify([
       message?.role || null,
@@ -301,7 +586,7 @@
     return stats;
   }
 
-  function buildDiagnostics(snapshot, passStats) {
+  function buildDiagnostics(snapshot, passStats, tailDiagnostics = null) {
     const stats = snapshot.stats || {};
     const references = stats.references || {};
     return {
@@ -341,8 +626,37 @@
             assistantPreamblesSuppressedByFinal: stats.assistantPreamblesSuppressedByFinal,
             timestampedMessages: stats.timestampedMessages,
             missingTimestampMessages: stats.missingTimestampMessages,
+            limitTailCaptured: Boolean(tailDiagnostics?.captured),
+            limitTailUserMatched: Boolean(tailDiagnostics?.userMatched),
+            limitTailMatchMethod: tailDiagnostics?.matchMethod || null,
+            networkTailAssistantMessagesRemoved: tailDiagnostics?.networkAssistantMessagesRemoved || 0,
+            domTailAssistantApplied: Boolean(tailDiagnostics?.applied),
           },
         },
+        ...(tailDiagnostics?.captured ? [{
+          event: 'CHATGPT_LIMIT_TAIL_USER_MATCHED',
+          details: {
+            matched: Boolean(tailDiagnostics.userMatched),
+            matchMethod: tailDiagnostics.matchMethod || null,
+            reason: tailDiagnostics.reason || null,
+          },
+        }, {
+          event: 'CHATGPT_LIMIT_TAIL_NETWORK_OBSERVED',
+          details: {
+            assistantMessages: tailDiagnostics.networkAssistantMessagesRemoved || 0,
+            assistantChars: tailDiagnostics.networkAssistantChars || 0,
+          },
+        }, {
+          event: 'CHATGPT_LIMIT_TAIL_OVERRIDE_APPLIED',
+          details: {
+            applied: Boolean(tailDiagnostics.applied),
+            source: tailDiagnostics.applied ? 'pre-reload-dom' : null,
+            assistantChars: tailDiagnostics.domAssistantChars || 0,
+            assistantHash: tailDiagnostics.domAssistantHash || null,
+            networkAssistantMessagesRemoved: tailDiagnostics.networkAssistantMessagesRemoved || 0,
+            reason: tailDiagnostics.reason || null,
+          },
+        }] : []),
         {
           event: 'CHATGPT_THREAD_REFERENCE_STATUS',
           details: {
@@ -386,19 +700,23 @@
 
     findScroller,
 
+    capturePreReloadTailSnapshot,
+
     getNetworkCaptureConfig() {
       return captureConfig();
     },
 
-    parseNetworkCaptures(captures) {
+    parseNetworkCaptures(captures, options = {}) {
       const passSnapshots = buildAllPassSnapshots(captures);
-      const selected = passSnapshots[passSnapshots.length - 1];
+      const networkSelected = passSnapshots[passSnapshots.length - 1];
       const conversationIds = new Set(passSnapshots.map((snapshot) => snapshot.conversationId).filter(Boolean));
       if (conversationIds.size > 1) {
         throw new Error(`ChatGPT Thread: проходы относятся к разным разговорам (${[...conversationIds].join(' / ')}).`);
       }
 
       const passStats = buildPassStats(passSnapshots);
+      const tailResult = applyPreReloadTailOverride(networkSelected, options.preReloadTailSnapshot || null);
+      const selected = tailResult.snapshot;
       const stats = selected.stats;
       const startedAt = selected.createTime || selected.messages.find((message) => message.timestamp)?.timestamp || null;
 
@@ -414,7 +732,7 @@
           assistant: stats.assistant,
           other: 0,
         },
-        diagnostics: buildDiagnostics(selected, passStats),
+        diagnostics: buildDiagnostics(selected, passStats, tailResult.diagnostics),
       };
     },
   });

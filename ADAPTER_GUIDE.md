@@ -83,13 +83,16 @@ Service-specific parser находится в `src/adapters/chatgpt/shared-wire-
 
 ## ChatGPT authenticated thread paginated network adapter
 
-Production 0.8.7 для ChatGPT thread URL с конечным сегментом `/c/<conversation-id>` использует гибридный transport: transcript читается только из штатных JSON responses, а `ISOLATED` content script локально изменяет позицию scroll-контейнера исключительно как trigger штатной pagination страницы.
+Production 0.8.8 для ChatGPT thread URL с конечным сегментом `/c/<conversation-id>` использует гибридный transport: transcript читается только из штатных JSON responses, а `ISOLATED` content script локально изменяет позицию scroll-контейнера исключительно как trigger штатной pagination страницы.
 
 В 0.8.6 этот trigger использует `direct-fast-pagination`: шаг равен примерно пяти высотам видимого scroll-контейнера (минимум 1200 px), после чего capture state проверяется снова. Это изменение не затрагивает wire parser и не превращает extension в инициатора backend pagination request.
 В 0.8.6 после обнаружения ожидаемого `/messages?before=<cursor>` дальнейшие scroll-команды блокируются до получения/обработки ответа; только затем разрешается следующий pagination trigger.
 
+В 0.8.8 перед **первым** reload authenticated thread дополнительно проверяется presentation-state live DOM. Если присутствует limit-banner, extension сохраняет последний user anchor и последний видимый primary assistant block в extension-owned `chrome.storage.session`. Это исключение не превращает DOM в основной transcript source: snapshot используется только как authoritative override последнего turn после network pagination. Если snapshot при обнаруженном banner нельзя надежно получить/сохранить, reload запрещен fail-safe. Дополнительные network passes используют тот же первоначальный snapshot и не перезаписывают его состоянием после reload.
+
 ```text
-ordinary reload
+optional conversation-limit DOM tail snapshot before reload
+→ ordinary reload
 → GET /backend-api/conversations/<id>?num_turns=10...
 → passive Network.getResponseBody
 → messages[] + page_info
@@ -102,7 +105,7 @@ ordinary reload
 
 Adapter не имеет права самостоятельно конструировать/отправлять `messages?before=`. Cursor используется только для validation уже наблюдаемой цепочки: request `before` следующей страницы должен совпасть с `start_cursor` предыдущего response. Первый response прохода должен быть tail (`has_next_page=false`), последний — start (`has_previous_page=false`).
 
-Site-specific JSON parser находится в `src/adapters/chatgpt/thread-wire-parser.js`. Он фильтрует внутренние `system/tool/thoughts/reasoning` records и нормализует только visible user + assistant final. Старый DOM transcript parser authenticated thread удален; DOM используется только для read-only поиска scroll-контейнера и browser-level scroll.
+Site-specific JSON parser находится в `src/adapters/chatgpt/thread-wire-parser.js`. Он фильтрует внутренние `system/tool/thoughts/reasoning` records и нормализует visible transcript. Старый полный DOM transcript parser authenticated thread удален; DOM используется для read-only поиска scroll-контейнера/browser-level scroll и для узкого pre-reload limit-tail snapshot 0.8.8.
 
 ## Local-cache adapter
 

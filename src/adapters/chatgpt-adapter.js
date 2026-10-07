@@ -87,6 +87,7 @@
     getHistoryStartState: delegate('getHistoryStartState'),
     getHistoryEndState: delegate('getHistoryEndState'),
     getNetworkCaptureConfig: delegate('getNetworkCaptureConfig'),
+    capturePreReloadTailSnapshot: delegate('capturePreReloadTailSnapshot'),
     parseNetworkCaptures: delegate('parseNetworkCaptures'),
 
     isHistoryStartReached(scroller) {

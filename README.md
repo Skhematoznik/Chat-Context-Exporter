@@ -2,7 +2,7 @@
 
 **Chat Context Exporter** — локальное Chromium MV3-расширение для экспорта AI-диалогов в Markdown.
 
-Текущая версия: **0.8.7**.
+Текущая версия: **0.8.8**.
 
 ## Архитектура 0.8.x
 
@@ -125,19 +125,24 @@ Web citations из `content_references[type="grouped_webpages"]` преобра�
 
 Полный HTML response используется только в памяти background-процесса для локального parsing. В content runtime передается уже компактный normalized snapshot; полный Document body не записывается в technical log и автоматически не сохраняется отдельным diagnostic artifact.
 
-## ChatGPT authenticated thread — paginated passive network 0.8.7
+## ChatGPT authenticated thread — paginated passive network 0.8.8
 
-В 0.8.7 добавлена transcript-normalization для presentation-only особенностей ChatGPT. Targeted reply с wire-envelope `# Selected text / ## My request` экспортирует только фактический пользовательский запрос. Видимый `is_thinking_preamble_message=true` / `channel=commentary` сохраняется только как fallback для незавершенного turn, если для того же `turn_exchange_id` нет обычного `channel=final`. UI-плашка о лимите обсуждения не является conversation message и не экспортируется.
+В 0.8.8 для состояния `conversation limit reached` добавлен отдельный presentation-safety contract. До первого reload extension ищет limit-banner в live DOM и, если он присутствует, сохраняет последний видимый `User → Assistant` tail. Последний user используется как anchor, а последний `assistant-message` с `data-markdown-text-tone="primary"` немедленно сериализуется в Markdown и сохраняется в extension-owned `chrome.storage.session`. Пока snapshot не сохранен надежно, reload не разрешается.
+
+После passive-network pagination этот pre-reload DOM assistant считается authoritative presentation truth для последнего turn: любой post-reload network assistant после совпавшего последнего user anchor — полный, частичный, изменившийся или отсутствующий — заменяется сохраненным DOM snapshot. Сама плашка лимита в Markdown не экспортируется. Shared ChatGPT этим механизмом не затрагивается.
+
+В 0.8.7 добавлена transcript-normalization для presentation-only особенностей ChatGPT. Targeted reply с wire-envelope `# Selected text / ## My request` экспортирует только фактический пользовательский запрос. Видимый `is_thinking_preamble_message=true` / `channel=commentary` сохраняется только как fallback для незавершенного turn, если для того же `turn_exchange_id` нет обычного `channel=final`. При наличии 0.8.8 limit-tail snapshot этот wire fallback имеет более низкий приоритет.
 
 В 0.8.6 browser-level pagination ускорена специально для network thread: extension двигает reverse scroll-контейнер прямыми шагами примерно по 5 видимых окон (не менее 1200 px) вместо общего smooth-шага 0,7 окна. Настроенные задержки между действиями сохраняются; меняется только число локальных scroll-действий. Backend requests по-прежнему инициирует сам интерфейс ChatGPT.
 После фиксации ожидаемого `/messages?before=<cursor>` в passive Network capture расширение прекращает scroll-команды до обработки этого ответа, поэтому не создает серии бессмысленных `delta=0` у верхней границы текущей страницы.
 
-Обычный авторизованный `https://chatgpt.com/c/<conversation-id>` больше не использует DOM как источник transcript. DOM нужен только для поиска scroll-контейнера и обычной пользовательской прокрутки.
+Обычный авторизованный `https://chatgpt.com/c/<conversation-id>` по-прежнему получает основной transcript из network JSON. DOM используется для scroll pagination и, только при обнаруженной limit-banner, как authoritative pre-reload source последнего видимого assistant-tail.
 
 Подтвержденный transport:
 
 ```text
 user click
+→ if conversation-limit banner: capture + persist authoritative last DOM tail
 → chrome.debugger attach
 → Network.enable
 → ordinary reload
@@ -302,7 +307,7 @@ Chat Context Exporter спроектирован как локальный passi
 
 ## Permissions
 
-`manifest.json` 0.8.7 использует:
+`manifest.json` 0.8.8 использует:
 
 ```text
 activeTab
@@ -330,12 +335,13 @@ src/ui/                       floating panel
 
 Template adapters, backup-копии и неиспользуемые future-заготовки в рабочем репозитории не хранятся.
 
-## Ограничения 0.8.7
+## Ограничения 0.8.8
 
 - ChatGPT Shared production parser подтвержден на трех public Shared fixtures текущего React Router wire-format; изменение серверной сериализации может потребовать обновления decoder.
 - ChatGPT Shared экспортирует metadata вложений, но не скачивает сами attachment bytes и не пытается превращать внутренние `sediment://`/file IDs в выдуманные внешние URL.
 - ChatGPT Shared file citations не имеют переносимого публичного URL; они сохраняются как текстовое имя источника и диапазон строк, когда такие metadata доступны.
 - ChatGPT `/c/...` зависит от текущего paginated JSON contract `messages[] + page_info` и от того, что штатный интерфейс инициирует предыдущую страницу при прокрутке вверх; изменение этого поведения может потребовать обновления adapter.
+- Pre-reload limit-tail recovery может сохранить только тот assistant-tail, который реально присутствует в DOM в момент запуска расширения. Если пользователь вручную перезагрузил страницу до запуска и исходный ответ уже исчез/изменился, расширение не может восстановить более раннюю DOM-версию.
 - Claude `content` в предоставленном образце содержит только `type="text"`; неизвестные content types пока диагностируются, но не преобразуются в Markdown без реального образца их структуры.
 - Attachment metadata у Grok/Claude распознается и журналируется, но mapping вложений требует отдельных тестовых разговоров.
 - У DeepSeek прямые `TOOL_OPEN` references могут быть восстановлены в ссылки, если URL однозначно найден в соответствующем search fragment. Для `TOOL_SEARCH` references без однозначного URL внутренний marker не выводится и URL не выдумывается.

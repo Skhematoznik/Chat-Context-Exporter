@@ -267,6 +267,7 @@
 
   app.modules.markdownExporter = {
     exportConversation,
+    renderBlocks,
     sanitizeFilenameBase,
     createFilename,
   };

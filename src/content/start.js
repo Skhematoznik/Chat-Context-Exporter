@@ -2013,6 +2013,30 @@
   }
 
 
+  function capturePreReloadTailSnapshot() {
+    if (typeof runtime.adapter?.capturePreReloadTailSnapshot !== 'function') {
+      return null;
+    }
+
+    const snapshot = runtime.adapter.capturePreReloadTailSnapshot();
+    if (!snapshot) {
+      return null;
+    }
+
+    log.write('CHATGPT_LIMIT_TAIL_CAPTURED', {
+      conversationId: snapshot.conversationId || null,
+      userMessageId: snapshot.user?.messageId || null,
+      userTurnKey: snapshot.user?.turnKey || null,
+      userChars: snapshot.user?.markdown?.length || 0,
+      userHash: snapshot.user?.hash || null,
+      assistantChars: snapshot.assistant?.markdown?.length || 0,
+      assistantHash: snapshot.assistant?.hash || null,
+      assistantPrimaryCandidates: snapshot.assistant?.primaryCandidates || null,
+      authoritative: snapshot.authoritative === true,
+    });
+    return snapshot;
+  }
+
   async function runNetworkAdapter(currentSettings, detection) {
     runtime.networkMode = true;
     runtime.adapter = detection.adapter;
@@ -2044,6 +2068,18 @@
       runtime.panel.setPass(1, totalPasses);
       runtime.panel.setStatus('Подключаюсь...');
 
+      let preReloadTailSnapshot = null;
+      try {
+        preReloadTailSnapshot = capturePreReloadTailSnapshot();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log.write('CHATGPT_LIMIT_TAIL_CAPTURE_FAILED', { message });
+        runtime.panel.setStatus(`Ошибка: ${message}`);
+        runtime.panel.markError();
+        await log.saveOnce('ERROR');
+        return false;
+      }
+
       const startResponse = await sendCaptureMessage({
         type: CAPTURE_START_MESSAGE,
         adapterId: runtime.adapter.id,
@@ -2056,6 +2092,7 @@
         responseProcessor: config.responseProcessor || null,
         expectedShareId: config.expectedShareId || null,
         expectedConversationId: config.expectedConversationId || null,
+        preReloadTailSnapshot,
         paginationMode: config.paginationMode || null,
         timeoutMs: config.timeoutMs || 60_000,
         totalPasses,
@@ -2147,7 +2184,9 @@
     log.importEntries?.(releaseState?.events || state.events || []);
 
     runtime.panel.setStatus('Разбираю данные...');
-    const parsed = runtime.adapter.parseNetworkCaptures(state.captures);
+    const parsed = runtime.adapter.parseNetworkCaptures(state.captures, {
+      preReloadTailSnapshot: state.preReloadTailSnapshot || null,
+    });
     const finalStats = parsed.stats;
     const diagnostics = parsed.diagnostics || {};
 

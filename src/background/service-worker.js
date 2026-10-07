@@ -57,6 +57,9 @@ const DEFAULT_CAPTURE_TIMEOUT_MS = 60_000;
 const MAX_CAPTURE_BODY_BYTES = 100 * 1024 * 1024;
 const LOCAL_CACHE_SYNC_TTL_MS = 2 * 60 * 1000;
 const LOCAL_CACHE_SYNC_STORAGE_PREFIX = 'chat-context-exporter:local-cache-sync:';
+const PRE_RELOAD_TAIL_STORAGE_PREFIX = 'chat-context-exporter:pre-reload-tail:';
+const MAX_PRE_RELOAD_TAIL_USER_CHARS = 256 * 1024;
+const MAX_PRE_RELOAD_TAIL_ASSISTANT_CHARS = 2 * 1024 * 1024;
 const saveRequests = new Map();
 const captureSessions = new Map();
 function nowMs() {
@@ -66,6 +69,87 @@ function nowMs() {
 function createId(prefix) {
   const random = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `${prefix}:${random}`;
+}
+
+function preReloadTailStorageKey(tabId) {
+  return `${PRE_RELOAD_TAIL_STORAGE_PREFIX}${tabId}`;
+}
+
+async function storePreReloadTailSnapshot(tabId, snapshot) {
+  await chrome.storage.session.set({
+    [preReloadTailStorageKey(tabId)]: snapshot,
+  });
+}
+
+async function removePreReloadTailSnapshot(tabId) {
+  await chrome.storage.session.remove(preReloadTailStorageKey(tabId));
+}
+
+function sanitizePreReloadTailSnapshot(value, expectedConversationId) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  if (value.authoritative !== true || value.reason !== 'conversation-limit') {
+    throw new Error('Некорректный контракт pre-reload DOM-tail snapshot.');
+  }
+
+  const conversationId = typeof value.conversationId === 'string' ? value.conversationId.trim() : '';
+  if (!conversationId) {
+    throw new Error('Pre-reload DOM-tail snapshot не содержит conversationId.');
+  }
+  if (expectedConversationId && conversationId !== expectedConversationId) {
+    throw new Error(`Pre-reload DOM-tail относится к другому разговору (${conversationId}).`);
+  }
+
+  const userMarkdown = typeof value.user?.markdown === 'string' ? value.user.markdown.trim() : '';
+  const userNormalizedText = typeof value.user?.normalizedText === 'string'
+    ? value.user.normalizedText.trim()
+    : '';
+  const assistantMarkdown = typeof value.assistant?.markdown === 'string'
+    ? value.assistant.markdown.trim()
+    : '';
+  if (!userMarkdown || !userNormalizedText) {
+    throw new Error('Pre-reload DOM-tail snapshot не содержит последнее сообщение пользователя.');
+  }
+  if (!assistantMarkdown) {
+    throw new Error('Pre-reload DOM-tail snapshot не содержит последний ответ ассистента.');
+  }
+  if (userMarkdown.length > MAX_PRE_RELOAD_TAIL_USER_CHARS) {
+    throw new Error('Последнее сообщение пользователя слишком велико для pre-reload snapshot.');
+  }
+  if (assistantMarkdown.length > MAX_PRE_RELOAD_TAIL_ASSISTANT_CHARS) {
+    throw new Error('Последний ответ ассистента слишком велик для pre-reload snapshot.');
+  }
+
+  return {
+    schemaVersion: 1,
+    source: 'pre-reload-limit-dom',
+    reason: 'conversation-limit',
+    authoritative: true,
+    conversationId,
+    capturedAt: typeof value.capturedAt === 'string' ? value.capturedAt : null,
+    user: {
+      turnKey: typeof value.user?.turnKey === 'string' && value.user.turnKey.trim()
+        ? value.user.turnKey.trim()
+        : null,
+      messageId: typeof value.user?.messageId === 'string' && value.user.messageId.trim()
+        ? value.user.messageId.trim()
+        : null,
+      markdown: userMarkdown,
+      normalizedText: userNormalizedText,
+      hash: typeof value.user?.hash === 'string' ? value.user.hash : null,
+    },
+    assistant: {
+      markdown: assistantMarkdown,
+      normalizedText: typeof value.assistant?.normalizedText === 'string'
+        ? value.assistant.normalizedText.trim()
+        : '',
+      hash: typeof value.assistant?.hash === 'string' ? value.assistant.hash : null,
+      primaryCandidates: Number.isFinite(Number(value.assistant?.primaryCandidates))
+        ? Math.max(1, Math.round(Number(value.assistant.primaryCandidates)))
+        : null,
+    },
+  };
 }
 
 function clampInteger(value, min, max, fallback) {
@@ -144,6 +228,19 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
     pageState: session.pageState ? { ...session.pageState } : null,
     paginationRequest: getCurrentPaginationRequest(session),
     error: session.error || null,
+    preReloadTail: session.preReloadTailSnapshot ? {
+      captured: true,
+      source: session.preReloadTailSnapshot.source,
+      reason: session.preReloadTailSnapshot.reason,
+      conversationId: session.preReloadTailSnapshot.conversationId,
+      userMessageId: session.preReloadTailSnapshot.user?.messageId || null,
+      userTurnKey: session.preReloadTailSnapshot.user?.turnKey || null,
+      assistantChars: session.preReloadTailSnapshot.assistant?.markdown?.length || 0,
+      assistantHash: session.preReloadTailSnapshot.assistant?.hash || null,
+    } : null,
+    preReloadTailSnapshot: includeCaptures && session.preReloadTailSnapshot
+      ? structuredClone(session.preReloadTailSnapshot)
+      : undefined,
     events: session.events.map((entry) => ({ ...entry })),
     captures: includeCaptures
       ? session.captures.map((capture) => ({ ...capture }))
@@ -291,6 +388,7 @@ async function failCaptureSession(session, error, stage) {
   });
   await detachCaptureDebugger(session);
   appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'error' });
+  await removePreReloadTailSnapshot(session.tabId).catch(() => {});
   await notifyCaptureSession(session);
 }
 
@@ -747,6 +845,28 @@ async function startCaptureSession(tabId, message) {
     180_000,
     DEFAULT_CAPTURE_TIMEOUT_MS,
   );
+  const expectedConversationId = typeof message.expectedConversationId === 'string'
+    && message.expectedConversationId.trim()
+    ? message.expectedConversationId.trim()
+    : null;
+
+  let preReloadTailSnapshot = null;
+  if (message.preReloadTailSnapshot != null) {
+    try {
+      preReloadTailSnapshot = sanitizePreReloadTailSnapshot(
+        message.preReloadTailSnapshot,
+        expectedConversationId,
+      );
+      await storePreReloadTailSnapshot(tabId, preReloadTailSnapshot);
+    } catch (error) {
+      return {
+        ok: false,
+        error: `Не удалось надежно сохранить последний DOM-tail до перезагрузки: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  } else {
+    await removePreReloadTailSnapshot(tabId).catch(() => {});
+  }
 
   const session = {
     id: createId('capture'),
@@ -767,9 +887,8 @@ async function startCaptureSession(tabId, message) {
     expectedShareId: typeof message.expectedShareId === 'string' && message.expectedShareId.trim()
       ? message.expectedShareId.trim()
       : null,
-    expectedConversationId: typeof message.expectedConversationId === 'string' && message.expectedConversationId.trim()
-      ? message.expectedConversationId.trim()
-      : null,
+    expectedConversationId,
+    preReloadTailSnapshot,
     paginationMode: message.paginationMode === 'scroll-up-until-start'
       ? 'scroll-up-until-start'
       : null,
@@ -835,6 +954,20 @@ async function startCaptureSession(tabId, message) {
     requestInterception: false,
     responseModification: false,
   });
+  if (preReloadTailSnapshot) {
+    appendCaptureEvent(session, 'CHATGPT_LIMIT_TAIL_CAPTURED', {
+      conversationId: preReloadTailSnapshot.conversationId,
+      userMessageId: preReloadTailSnapshot.user?.messageId || null,
+      userTurnKey: preReloadTailSnapshot.user?.turnKey || null,
+      userChars: preReloadTailSnapshot.user?.markdown?.length || 0,
+      userHash: preReloadTailSnapshot.user?.hash || null,
+      assistantChars: preReloadTailSnapshot.assistant?.markdown?.length || 0,
+      assistantHash: preReloadTailSnapshot.assistant?.hash || null,
+      assistantPrimaryCandidates: preReloadTailSnapshot.assistant?.primaryCandidates || null,
+      authoritative: true,
+      storage: 'chrome.storage.session',
+    });
+  }
   appendCaptureEvent(session, 'DEBUGGER_ATTACH_STARTED', {});
 
   try {
@@ -939,6 +1072,7 @@ async function cancelCaptureSession(tabId) {
   appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'cancelled' });
   const state = serializeCaptureSession(session, { includeCaptures: false });
   captureSessions.delete(tabId);
+  await removePreReloadTailSnapshot(tabId).catch(() => {});
   return { ok: true, state };
 }
 
@@ -954,6 +1088,7 @@ async function releaseCaptureSession(tabId) {
   appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'completed' });
   const state = serializeCaptureSession(session, { includeCaptures: false });
   captureSessions.delete(tabId);
+  await removePreReloadTailSnapshot(tabId).catch(() => {});
   return { ok: true, state };
 }
 
@@ -1204,6 +1339,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void removeLocalCacheSyncSession(tabId).catch(() => {});
+  void removePreReloadTailSnapshot(tabId).catch(() => {});
 
   const session = captureSessions.get(tabId);
   if (!session) {

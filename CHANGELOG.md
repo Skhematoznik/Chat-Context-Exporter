@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.8 — 2026-10-07
+
+- Для обычного authenticated ChatGPT thread добавлен pre-reload snapshot последнего видимого `User → Assistant` tail, когда в live DOM присутствует плашка о максимальной длине обсуждения.
+- Snapshot снимается **до первого reload**, привязывается к `conversationId` и последнему user turn/message ID, а последний `assistant-message` с `data-markdown-text-tone="primary"` сразу сериализуется в Markdown.
+- Snapshot транзакционно сохраняется в extension-owned `chrome.storage.session`; если при наличии limit-banner user/assistant tail не найден или snapshot не удалось сохранить, reload отменяется, чтобы не уничтожить единственную видимую версию ответа.
+- После обычной passive-network pagination сохраненный DOM assistant имеет безусловный приоритет над post-reload network tail: отсутствующий, частичный или изменившийся последний assistant-response удаляется и заменяется pre-reload DOM snapshot.
+- User anchor сначала сопоставляется по стабильному message ID, резервно — по нормализованному тексту; override применяется только к последнему user turn того же conversation.
+- Добавлены diagnostics `CHATGPT_LIMIT_TAIL_CAPTURED`, `CHATGPT_LIMIT_TAIL_USER_MATCHED`, `CHATGPT_LIMIT_TAIL_NETWORK_OBSERVED`, `CHATGPT_LIMIT_TAIL_OVERRIDE_APPLIED` и поля статуса `limitTailCaptured`, `limitTailUserMatched`, `networkTailAssistantMessagesRemoved`, `domTailAssistantApplied`.
+- Для текущего ChatGPT DOM serializer распознает `data-markdown-copy="code-block"`; Shared adapter и общая pagination/state machine 0.8.6–0.8.7 функционально не изменялись.
+
 ## 0.8.7 — 2026-10-02
 
 - ChatGPT targeted replies больше не экспортируют служебный wire-envelope `Selected text / Selection / My request` внутрь пользовательского сообщения; сохраняется фактический `My request`.

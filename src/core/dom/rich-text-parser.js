@@ -86,6 +86,10 @@
       return false;
     }
 
+    if (element.matches('[data-markdown-copy="code-block"]')) {
+      return Boolean(element.querySelector('pre, code'));
+    }
+
     return (
       element.matches('[data-testid="code-block"]')
       || element.classList.contains('chat-code-block')
@@ -168,11 +172,15 @@
 
   function parseCodeBlock(element) {
     const pre = element.tagName === 'PRE' ? element : element.querySelector('pre');
-    if (!pre) {
+    const codeElement = pre
+      ? (pre.querySelector('code') || pre)
+      : element.matches('[data-markdown-copy="code-block"]')
+        ? element.querySelector('code')
+        : null;
+    if (!codeElement) {
       return null;
     }
 
-    const codeElement = pre.querySelector('code') || pre;
     return {
       type: 'codeBlock',
       language: parseLanguageFromCodeBlock(element, codeElement),
