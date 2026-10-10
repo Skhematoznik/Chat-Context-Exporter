@@ -1,0 +1,73 @@
+name: "Сообщить об ошибке"
+description: "Баг при экспорте диалога через Chat Context Exporter"
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Публичный репозиторий.** Не размещайте в issue приватные диалоги, токены, cookies, session IDs, секретные URL или персональные данные. Перед прикреплением скриншота или технического лога удалите конфиденциальную информацию. Исправления и поддержка предоставляются без гарантий.
+  - type: input
+    id: extension-version
+    attributes:
+      label: Версия расширения
+      description: "Номер из chrome://extensions"
+      placeholder: "1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: service
+    attributes:
+      label: Сервис
+      options:
+        - ChatGPT — авторизованный чат
+        - ChatGPT — Shared
+        - Claude
+        - Grok
+        - DeepSeek
+        - Другое
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Браузер и версия
+      placeholder: "Google Chrome, версия ..."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      description: "Что сделать, чтобы получить ошибку?"
+      placeholder: "1. Открыть ...
+2. Нажать ...
+3. Наблюдать ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемый результат
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Фактический результат
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Технический лог (только после обезличивания, необязательно)
+      description: "Удалите конфиденциальные адреса, идентификаторы разговоров, содержимое диалогов и токены."
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Подтверждение безопасности
+      options:
+        - label: "Я не публикую конфиденциальные данные и предварительно проверил(а) все вложения и логи."
+          required: true
