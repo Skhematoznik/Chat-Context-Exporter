@@ -558,12 +558,15 @@
       parts.push(attachmentMarkdown);
     }
     const combinedMarkdown = parts.join('\n\n').trim();
+    const portable = !isUser && globalThis.__chatContextExporterDilToMarkdown
+      ? globalThis.__chatContextExporterDilToMarkdown.normalize(combinedMarkdown)
+      : { markdown: combinedMarkdown };
     const isAssistantVisible = message?.author?.role === 'assistant'
       && message?.recipient === 'all'
       && (message?.channel === 'final' || isAssistantPreambleMessage(message));
     const generatedFiles = isAssistantVisible
-      ? normalizeGeneratedFileCards(combinedMarkdown)
-      : { markdown: combinedMarkdown, found: 0, moved: 0 };
+      ? normalizeGeneratedFileCards(portable.markdown)
+      : { markdown: portable.markdown, found: 0, moved: 0 };
     return {
       contentType,
       markdown: generatedFiles.markdown,

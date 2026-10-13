@@ -1187,6 +1187,9 @@
       case 'awaiting-scroll':
         runtime.panel.setStatus('Прокручиваю к предыдущей странице...');
         break;
+      case 'waiting-http-retry':
+        runtime.panel.setStatus('ChatGPT вернул HTTP 403. Через 2,5 с перезагружу страницу и повторю сбор...');
+        break;
       case 'waiting-next-pass':
         runtime.panel.setStatus('Готовлю дополнительный проход...');
         break;

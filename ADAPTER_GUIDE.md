@@ -154,3 +154,7 @@ DOM остается fallback-классом только для сервисо�
 ### ChatGPT presentation normalization 0.8.7
 
 Для authenticated thread и shared snapshot targeted-reply wire envelope с `# Selected text` / `## My request` не считается буквальным текстом пользователя: при наличии `targeted_reply_source_message_id` экспортируется только фактическая часть `My request`. Видимый `is_thinking_preamble_message=true` с `channel=commentary` обычно является промежуточным сообщением и подавляется, если в том же `turn_exchange_id` существует `channel=final`; если final отсутствует из-за прерванного/исчерпанного turn, preamble сохраняется как fallback видимого ответа ассистента. UI-banner о лимите разговора не является transcript message и не экспортируется.
+
+## ChatGPT DIL → Markdown (кандидат 1.2)
+
+`src/adapters/chatgpt/dil-to-markdown.js` подключен только в background service worker перед ChatGPT `thread-wire-parser.js` и `shared-wire-parser.js`. Преобразование выполняется после привязанных по индексам `content_references` и targeted-reply нормализации, но перед переносом generated file cards и формированием финальных Markdown blocks. Фрагменты в fenced/inline code защищены. Простые статические `{#each}` массивы `name/value/desc` сериализуются в Markdown-таблицы; непонятная динамика остается в маркированном DIL-блоке, без `eval`. Прочие адаптеры не используют модуль.

@@ -1,3 +1,4 @@
+importScripts('../adapters/chatgpt/dil-to-markdown.js');
 importScripts('../adapters/chatgpt/shared-wire-parser.js');
 importScripts('../adapters/chatgpt/thread-wire-parser.js');
 
@@ -54,6 +55,8 @@ const ALLOWED_TEXT_MIME_TYPES = new Set([
 ]);
 const SAVE_REQUEST_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_CAPTURE_TIMEOUT_MS = 60_000;
+const CHATGPT_HTTP_403_RETRY_DELAY_MS = 2500;
+const CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS = 1;
 const MAX_CAPTURE_BODY_BYTES = 100 * 1024 * 1024;
 const LOCAL_CACHE_SYNC_TTL_MS = 2 * 60 * 1000;
 const LOCAL_CACHE_SYNC_STORAGE_PREFIX = 'chat-context-exporter:local-cache-sync:';
@@ -228,6 +231,10 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
     pageState: session.pageState ? { ...session.pageState } : null,
     paginationRequest: getCurrentPaginationRequest(session),
     error: session.error || null,
+    http403RetryCount: session.http403RetryCount || 0,
+    http403MaxRetries: session.responseProcessor === 'chatgpt-thread-json'
+      ? CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS
+      : 0,
     preReloadTail: session.preReloadTailSnapshot ? {
       captured: true,
       source: session.preReloadTailSnapshot.source,
@@ -403,12 +410,30 @@ function scheduleCaptureTimeout(session) {
   }, session.timeoutMs);
 }
 
-async function beginCapturePass(session) {
+async function beginCapturePass(session, { retryHttp403 = false } = {}) {
   if (!session || session.phase === 'cancelled' || session.phase === 'released' || session.phase === 'error') {
     return;
   }
+  if (retryHttp403 && session.phase !== 'waiting-http-retry') {
+    return;
+  }
 
-  session.pass += 1;
+  if (retryHttp403) {
+    // A failed pagination attempt is incomplete: discard only this pass.
+    // Completed earlier passes and the authoritative pre-reload tail remain intact.
+    const discarded = session.captures.length;
+    session.captures = session.captures.filter((capture) => capture.pass !== session.pass);
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_403_RETRY_STARTED', {
+      pass: session.pass,
+      retry: session.http403RetryCount,
+      discardedCaptures: discarded - session.captures.length,
+      previousPassCapturesPreserved: session.captures.length,
+    });
+  } else {
+    session.pass += 1;
+    session.http403RetryCount = 0;
+  }
+  session.attemptEpoch += 1;
   session.phase = 'capturing';
   session.error = null;
   session.currentPassCaptured = false;
@@ -417,15 +442,19 @@ async function beginCapturePass(session) {
   session.seenPageStartCursors = new Set();
   session.currentPassTranscriptIds = new Set();
   session.pendingRequests.clear();
-  appendCaptureEvent(session, 'PASS_STARTED', {
-    pass: session.pass,
-    totalPasses: session.totalPasses,
-    extraPass: session.pass > 1,
-    capturesBefore: session.captures.length,
-  });
+  if (!retryHttp403) {
+    appendCaptureEvent(session, 'PASS_STARTED', {
+      pass: session.pass,
+      totalPasses: session.totalPasses,
+      extraPass: session.pass > 1,
+      capturesBefore: session.captures.length,
+    });
+  }
   appendCaptureEvent(session, 'PAGE_RELOAD_REQUESTED', {
     pass: session.pass,
     totalPasses: session.totalPasses,
+    reason: retryHttp403 ? 'http-403-recovery' : 'normal-pass',
+    http403RetryCount: session.http403RetryCount,
   });
 
   scheduleCaptureTimeout(session);
@@ -476,9 +505,81 @@ async function completeCapturePass(session) {
   await notifyCaptureSession(session);
 }
 
+function isCurrentChatGptThreadPageRequest(session, requestInfo) {
+  if (session.responseProcessor !== 'chatgpt-thread-json') {
+    return false;
+  }
+  const requestBefore = getRequestBeforeCursor(requestInfo.url);
+  if (!session.pageState) {
+    return !requestBefore;
+  }
+  return Boolean(requestBefore && requestBefore === session.pageState.startCursor);
+}
+
+async function handleCaptureHttpError(session, requestId, requestInfo) {
+  if (session.phase !== 'capturing' || requestInfo.attemptEpoch !== session.attemptEpoch) {
+    return;
+  }
+  const status = Number(requestInfo.status);
+  const requestBefore = getRequestBeforeCursor(requestInfo.url);
+  const isChatGptPage = isCurrentChatGptThreadPageRequest(session, requestInfo);
+  if (session.responseProcessor === 'chatgpt-thread-json' && !isChatGptPage) {
+    appendCaptureEvent(session, 'CHATGPT_THREAD_RESPONSE_SKIPPED', {
+      pass: session.pass,
+      requestId,
+      reason: 'http-error-outside-current-cursor-chain',
+      status,
+    });
+    return;
+  }
+
+  appendCaptureEvent(session, 'NETWORK_HTTP_ERROR', {
+    pass: session.pass,
+    requestId,
+    status,
+    mimeType: requestInfo.mimeType,
+    beforeCursor: requestBefore,
+    pageSequence: session.pageState?.pageSequence || null,
+  });
+
+  if (status === 403 && isChatGptPage
+      && session.http403RetryCount < CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS) {
+    session.http403RetryCount += 1;
+    clearCaptureTimer(session);
+    session.phase = 'waiting-http-retry';
+    session.pendingRequests.clear();
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_403_RETRY_SCHEDULED', {
+      pass: session.pass,
+      retry: session.http403RetryCount,
+      maxRetries: CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS,
+      delayMs: CHATGPT_HTTP_403_RETRY_DELAY_MS,
+      beforeCursor: requestBefore,
+    });
+    session.timer = setTimeout(() => {
+      session.timer = null;
+      void beginCapturePass(session, { retryHttp403: true });
+    }, CHATGPT_HTTP_403_RETRY_DELAY_MS);
+    await notifyCaptureSession(session);
+    return;
+  }
+
+  const description = status === 403
+    ? 'Сервер ChatGPT вернул HTTP 403 (доступ к странице истории отклонён).'
+    : `Сервер вернул HTTP ${status} при получении истории диалога.`;
+  const retryNote = status === 403 && isChatGptPage
+    ? ' Повторная попытка через 2,5 секунды и перезагрузка страницы не помогли.'
+    : '';
+  await failCaptureSession(session, new Error(
+    `${description}${retryNote} Экспорт не создан: история неполная. `
+    + 'Попробуйте обновить страницу и повторить экспорт позже.',
+  ), 'http-response');
+}
+
 async function captureResponseBody(session, requestId, requestInfo, params) {
   const paginated = session?.paginationMode === 'scroll-up-until-start';
-  if (!session || (!paginated && session.currentPassCaptured) || requestInfo.handled) {
+  if (!session || session.phase !== 'capturing'
+      || requestInfo.attemptEpoch !== session.attemptEpoch
+      || (!paginated && session.currentPassCaptured) || requestInfo.handled) {
     return;
   }
 
@@ -490,6 +591,10 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
       'Network.getResponseBody',
       { requestId },
     );
+    // An HTTP recovery or cancellation may have started during the CDP call.
+    if (session.phase !== 'capturing' || requestInfo.attemptEpoch !== session.attemptEpoch) {
+      return;
+    }
 
     let body = typeof result?.body === 'string' ? result.body : '';
     if (result?.base64Encoded) {
@@ -694,6 +799,9 @@ async function captureResponseBody(session, requestId, requestInfo, params) {
       await completeCapturePass(session);
     }
   } catch (error) {
+    if (session.phase !== 'capturing' || requestInfo.attemptEpoch !== session.attemptEpoch) {
+      return;
+    }
     appendCaptureEvent(session, 'NETWORK_BODY_CAPTURE_FAILED', {
       pass: session.pass,
       requestId,
@@ -735,6 +843,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       resourceType: String(params?.type || '') || null,
       status: null,
       mimeType: null,
+      attemptEpoch: session.attemptEpoch,
       handled: false,
     };
     session.pendingRequests.set(params.requestId, requestInfo);
@@ -767,7 +876,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 
   const requestInfo = session.pendingRequests.get(params?.requestId);
-  if (!requestInfo) {
+  if (!requestInfo || requestInfo.attemptEpoch !== session.attemptEpoch
+      || session.phase !== 'capturing') {
     return;
   }
 
@@ -781,6 +891,11 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       mimeType: requestInfo.mimeType,
       url: requestInfo.url,
     });
+    if (Number(requestInfo.status) >= 400) {
+      // Never parse a service-side HTTP failure (often an HTML challenge) as JSON.
+      requestInfo.handled = true;
+      void handleCaptureHttpError(session, params.requestId, requestInfo);
+    }
     return;
   }
 
@@ -904,6 +1019,8 @@ async function startCaptureSession(tabId, message) {
     pageState: null,
     seenPageStartCursors: new Set(),
     currentPassTranscriptIds: new Set(),
+    attemptEpoch: 0,
+    http403RetryCount: 0,
     matchedRequests: 0,
     captures: [],
     events: [],
