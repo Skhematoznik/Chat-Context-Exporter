@@ -83,6 +83,7 @@
   const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
   const CAPTURE_CONTINUE_MESSAGE = 'chat-context-exporter:capture:continue';
   const CAPTURE_SCROLL_STEP_MESSAGE = 'chat-context-exporter:capture:scroll-step';
+  const CAPTURE_GENERATION_RESTART_MESSAGE = 'chat-context-exporter:capture:generation-restart';
   const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
   const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
   const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -92,6 +93,9 @@
   const LOCAL_CACHE_STABILITY_MATCHES = 2;
   const CHATGPT_NETWORK_FAST_SCROLL_SETTLE_MS = 120;
   const CHATGPT_NETWORK_RESPONSE_POLL_MS = 200;
+  const CHATGPT_GENERATION_MAX_WAIT_MS = 180_000;
+  const CHATGPT_GENERATION_STABILITY_MS = 1800;
+  const CHATGPT_GENERATION_POLL_MS = 350;
 
   async function resolveSettings() {
     if (runtime.settings) {
@@ -1208,6 +1212,45 @@
     }
   }
 
+  function isChatGptGenerating() {
+    const guard = globalThis.__chatContextExporterGenerationGuard;
+    if (!guard?.isGenerating) throw new Error('ChatGPT: проверка генерации недоступна.');
+    return guard.isGenerating(document);
+  }
+
+  async function waitForChatGptGenerationToSettle(phase) {
+    const deadline = Date.now() + CHATGPT_GENERATION_MAX_WAIT_MS;
+    let idleSince = null;
+    let observedActive = false;
+    let lastNotice = 0;
+    log.write('CHATGPT_GENERATION_GUARD_STARTED', {phase});
+    for (;;) {
+      if (runtime.aborted) return null;
+      const generating = isChatGptGenerating();
+      if (generating) {
+        if (!observedActive) log.write('CHATGPT_GENERATION_ACTIVE', {phase});
+        observedActive = true;
+        idleSince = null;
+        if (Date.now() - lastNotice > 3000) {
+          runtime.panel?.setStatus('ChatGPT формирует ответ — ожидаю исчезновения кнопки «Остановить»...');
+          lastNotice = Date.now();
+        }
+      } else {
+        if (idleSince === null) idleSince = Date.now();
+        if (Date.now() - idleSince >= CHATGPT_GENERATION_STABILITY_MS) {
+          log.write('CHATGPT_GENERATION_GUARD_PASSED', {phase, observedActive});
+          return {observedActive};
+        }
+      }
+      if (Date.now() >= deadline) {
+        log.write('CHATGPT_GENERATION_GUARD_TIMEOUT', {phase, observedActive});
+        throw new Error('ChatGPT продолжает формировать ответ (кнопка «Остановить»). '
+          + 'Экспорт не запущен: дождитесь окончания ответа и повторите попытку.');
+      }
+      if (!await sleep(CHATGPT_GENERATION_POLL_MS, runtime.abortController.signal)) return null;
+    }
+  }
+
   async function waitForNetworkScroller() {
     const deadline = Date.now() + 30_000;
     for (;;) {
@@ -2073,6 +2116,12 @@
       runtime.panel.setPass(1, totalPasses);
       runtime.panel.setStatus('Подключаюсь...');
 
+      if (config.responseProcessor === 'chatgpt-thread-json') {
+        const stable = await waitForChatGptGenerationToSettle('before-start');
+        if (!stable || runtime.aborted) return false;
+        runtime.panel.setStatus('Ответ ChatGPT стабилизировался. Подключаю сетевой захват...');
+      }
+
       let preReloadTailSnapshot = null;
       try {
         preReloadTailSnapshot = capturePreReloadTailSnapshot();
@@ -2143,6 +2192,23 @@
     configureNetworkPanel(state.totalPasses || totalPasses);
     runtime.panel.setMessageCount(0);
     updateNetworkPanel(state);
+
+    if (config.responseProcessor === 'chatgpt-thread-json'
+        && ['armed', 'capturing', 'awaiting-scroll', 'ready'].includes(state.phase)) {
+      const stable = await waitForChatGptGenerationToSettle('after-reload');
+      if (!stable || runtime.aborted) return false;
+      if (stable.observedActive) {
+        log.write('CHATGPT_GENERATION_RECAPTURE_REQUIRED', {
+          pass:state.pass, previousRestarts:state.generationRestartCount || 0,
+        });
+        const restart = await sendCaptureMessage({type:CAPTURE_GENERATION_RESTART_MESSAGE});
+        if (!restart.ok) {
+          throw new Error(restart.error || 'Не удалось обновить историю после завершения генерации.');
+        }
+        // SW reloads after the response settled; the new content script resumes.
+        return true;
+      }
+    }
 
     state = await waitForNetworkCaptureState(state, currentSettings, config);
     if (!state || runtime.aborted) {
@@ -2380,6 +2446,13 @@
         runtime.panel?.setStatus(`Ошибка: ${message}`);
         runtime.panel?.markError();
         runtime.running = false;
+        // A DOM-wait timeout/error must not leave chrome.debugger attached.
+        if (runtime.networkMode) {
+          try {
+            const cancellation = await sendCaptureMessage({type:CAPTURE_CANCEL_MESSAGE});
+            log.importEntries?.(cancellation?.state?.events || []);
+          } catch {} // The session may already have been released by the background.
+        }
         await log.saveOnce('ERROR');
       }
       return;

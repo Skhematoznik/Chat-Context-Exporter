@@ -74,33 +74,31 @@ test('malformed component markup is preserved rather than dropped', () => {
   assert.equal(normalize(source).failed, true);
 });
 
-test('real exported chat fixture normalizes DIL while keeping examples', () => {
-  const file = '/mnt/data/№ 7 AWF.md';
-  if (!fs.existsSync(file)) return;
-  const source = fs.readFileSync(file, 'utf8');
-  const messages = source.split(/\n---\n/).filter((chunk) => chunk.includes('***Ассистент***'));
-  assert.equal(messages.length, 13);
-  let normalizedCount = 0;
-  for (const message of messages) {
-    const converted = normalize(message);
-    assert.equal(converted.failed, false);
-    normalizedCount += converted.components;
-    assert.doesNotMatch(converted.markdown, /<\/?(?:Link|row|box|icon|badge|button|text|title|caption|divider)\b/);
-  }
-  assert.ok(normalizedCount >= 120);
+test('standalone ChatGPT markup fixture normalizes links and preserves code examples', () => {
+  const example = '<row><icon name="folder"/><Link url="https://drive.google.com/drive/folders/demo">Открыть папку</Link></row>';
+  const code = '```jsx\n<Link url="https://code.example">literal</Link>\n```';
+  const converted = normalize(`${example}\n\n${code}`);
+  assert.equal(converted.failed, false);
+  assert.match(converted.markdown, /\[Открыть папку\]\(https:\/\/drive\.google\.com\/drive\/folders\/demo\)/);
+  assert.ok(converted.markdown.includes(code));
 });
 
-test('ChatGPT authenticated thread parser normalizes real wire response only for assistant', () => {
-  const wirePath = '/mnt/data/Вставленный текст.txt';
-  if (!fs.existsSync(wirePath)) return;
+test('standalone ChatGPT authenticated thread JSON transforms assistant markup only', () => {
   require('../src/adapters/chatgpt/thread-wire-parser.js');
-  const payload = fs.readFileSync(wirePath, 'utf8');
-  const parsed = globalThis.__chatContextExporterThreadWireParser.parsePageBody(payload, {});
-  assert.equal(parsed.stats.total, 10);
-  const withMarkup = parsed.messages.filter((item) => item.role === 'assistant'
-    && item.blocks[0].value.includes('['));
-  assert.ok(withMarkup.length > 0);
-  for (const item of parsed.messages.filter((item) => item.role === 'assistant')) {
-    assert.doesNotMatch(item.blocks[0].value, /<\/?(?:Link|row|box|icon|badge|button)\b/);
-  }
+  const fixture = {
+    conversation_id: 'demo',
+    page_info: {start_cursor: 'u1',end_cursor:'a1',has_previous_page:false,has_next_page:false},
+    messages: [
+      {id:'u1',author:{role:'user'},recipient:'all',channel:null,create_time:1792100000,
+        content:{content_type:'text',parts:['Сохранить <Link url="https://literal.example">так</Link>']}},
+      {id:'a1',author:{role:'assistant'},recipient:'all',channel:'final',create_time:1792100001,
+        content:{content_type:'text',parts:['<Link url="https://actual.example">Здесь</Link>']}},
+    ],
+  };
+  const parsed = globalThis.__chatContextExporterThreadWireParser.parsePageBody(JSON.stringify(fixture), {});
+  assert.equal(parsed.stats.total, 2);
+  const assistant = parsed.messages.find(x=>x.role==='assistant');
+  const user = parsed.messages.find(x=>x.role==='user');
+  assert.match(assistant.blocks[0].value, /\[Здесь\]\(https:\/\/actual\.example\)/);
+  assert.match(user.blocks[0].value, /<Link/);
 });

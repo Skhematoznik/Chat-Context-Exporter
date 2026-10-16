@@ -1,0 +1,44 @@
+[
+  {
+    "startCursor": "test-cursor-01",
+    "endCursor": "test-page-end-01",
+    "hasPreviousPage": true,
+    "hasNextPage": false,
+    "rawMessages": 118
+  },
+  {
+    "startCursor": "test-cursor-02",
+    "endCursor": "test-page-end-02",
+    "hasPreviousPage": true,
+    "hasNextPage": true,
+    "rawMessages": 263
+  },
+  {
+    "startCursor": "test-cursor-03",
+    "endCursor": "test-page-end-03",
+    "hasPreviousPage": true,
+    "hasNextPage": true,
+    "rawMessages": 103
+  },
+  {
+    "startCursor": "test-cursor-04",
+    "endCursor": "test-page-end-04",
+    "hasPreviousPage": true,
+    "hasNextPage": true,
+    "rawMessages": 189
+  },
+  {
+    "startCursor": "test-cursor-05",
+    "endCursor": "test-page-end-05",
+    "hasPreviousPage": true,
+    "hasNextPage": true,
+    "rawMessages": 105
+  },
+  {
+    "startCursor": "test-cursor-06",
+    "endCursor": "test-page-end-06",
+    "hasPreviousPage": true,
+    "hasNextPage": true,
+    "rawMessages": 84
+  }
+]
