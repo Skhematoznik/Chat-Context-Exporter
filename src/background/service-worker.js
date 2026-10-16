@@ -45,6 +45,7 @@ const CAPTURE_RELEASE_MESSAGE = 'chat-context-exporter:capture:release';
 const CAPTURE_CONTINUE_MESSAGE = 'chat-context-exporter:capture:continue';
 const CAPTURE_SCROLL_STEP_MESSAGE = 'chat-context-exporter:capture:scroll-step';
 const CAPTURE_GENERATION_RESTART_MESSAGE = 'chat-context-exporter:capture:generation-restart';
+const CAPTURE_SKIP_EXTRA_PASS_MESSAGE = 'chat-context-exporter:capture:skip-extra-pass';
 const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
 const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
 const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -238,6 +239,9 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
     paginationRequest: getCurrentPaginationRequest(session),
     bufferedPaginationPages: session.bufferedPages?.size || 0,
     generationRestartCount: session.generationRestartCount || 0,
+    completedPasses: session.completedPasses || 0,
+    captureWarning: session.captureWarning || null,
+    skippedExtraPasses: session.skippedExtraPasses || 0,
     error: session.error || null,
     http403RetryCount: session.http403RetryCount || 0,
     http403MaxRetries: session.responseProcessor === 'chatgpt-thread-json'
@@ -395,10 +399,65 @@ async function notifyCaptureSession(session) {
   }
 }
 
+// A confirmed complete pass is immutable. A failure in an optional pass must not
+// destroy its result, but must be visible in the log and exported artifact.
+async function skipIncompleteExtraPass(session, error, stage) {
+  if (!session || session.responseProcessor !== 'chatgpt-thread-json'
+      || session.pass <= 1 || (session.completedPasses || 0) < 1
+      || !session.captures.some((capture) => capture.pass === session.completedPasses)) {
+    return false;
+  }
+  clearCaptureTimer(session);
+  clearCursorGapTimer(session);
+  const dropped = session.captures.filter((capture) => capture.pass > session.completedPasses).length;
+  session.captures = session.captures.filter((capture) => capture.pass <= session.completedPasses);
+  session.pendingRequests.clear();
+  session.bufferedPages?.clear?.();
+  session.bufferedPageBytes = 0;
+  session.cursorGapStartedAt = null;
+  session.skippedExtraPasses = Math.max(0, session.totalPasses - session.completedPasses);
+  const cause = error instanceof Error ? error.message : String(error);
+  session.captureWarning = `Дополнительная проверка истории не выполнена (${cause}). `
+    + `Сохранён только полный проход ${session.completedPasses} из ${session.totalPasses}.`;
+  session.error = null;
+  session.phase = 'ready';
+  appendCaptureEvent(session, 'CHATGPT_EXTRA_PASS_SKIPPED', {
+    failedPass: session.pass, completedPasses: session.completedPasses,
+    requestedPasses: session.totalPasses, discardedPages: dropped,
+    stage, cause,
+  });
+  appendCaptureEvent(session, 'CAPTURE_READY_WITH_WARNING', {
+    completedPasses: session.completedPasses,
+    requestedPasses: session.totalPasses,
+    captures: session.captures.length,
+    warning: session.captureWarning,
+  });
+  const wasAttached = session.attached;
+  await detachCaptureDebugger(session);
+  if (wasAttached) appendCaptureEvent(session, 'DEBUGGER_DETACHED', {reason:'optional-pass-skipped'});
+  await notifyCaptureSession(session);
+  return true;
+}
+
+async function skipExtraPassAfterGeneration(tabId) {
+  const session = captureSessions.get(tabId);
+  if (!session) return {ok:false, error:'Сессия захвата не найдена.'};
+  if (session.phase === 'ready' && session.captureWarning) {
+    return {ok:true, state:serializeCaptureSession(session)};
+  }
+  const skipped = await skipIncompleteExtraPass(session,
+    new Error('при перезагрузке страницы повторно обнаружена активная генерация ChatGPT'),
+    'generation-active-extra-pass');
+  return skipped
+    ? {ok:true, state:serializeCaptureSession(session)}
+    : {ok:false, error:'Нет завершённого основного прохода для безопасного сохранения.'};
+}
+
 async function failCaptureSession(session, error, stage) {
-  if (!session || session.phase === 'released' || session.phase === 'cancelled') {
+  if (!session || ['released', 'cancelled', 'ready', 'error'].includes(session.phase)) {
     return;
   }
+  if (await skipIncompleteExtraPass(session, error, stage)) return;
 
   clearCaptureTimer(session);
   clearCursorGapTimer(session);
@@ -409,8 +468,9 @@ async function failCaptureSession(session, error, stage) {
     pass: session.pass,
     message: session.error,
   });
+  const wasAttached = session.attached;
   await detachCaptureDebugger(session);
-  appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'error' });
+  if (wasAttached) appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'error' });
   await removePreReloadTailSnapshot(session.tabId).catch(() => {});
   await notifyCaptureSession(session);
 }
@@ -494,7 +554,9 @@ async function beginCapturePass(session, { retryHttp403 = false } = {}) {
 }
 
 async function completeCapturePass(session) {
+  if (session.phase === 'error' || session.phase === 'ready' || session.phase === 'cancelled') return;
   clearCaptureTimer(session);
+  session.completedPasses = Math.max(session.completedPasses || 0, session.pass);
   clearCursorGapTimer(session);
   appendCaptureEvent(session, 'PASS_COMPLETED', {
     pass: session.pass,
@@ -1092,6 +1154,9 @@ async function startCaptureSession(tabId, message) {
     cursorGapTimer: null,
     drainingPages: false,
     generationRestartCount: 0,
+    completedPasses: 0,
+    captureWarning: null,
+    skippedExtraPasses: 0,
     currentPassTranscriptIds: new Set(),
     attemptEpoch: 0,
     http403RetryCount: 0,
@@ -1205,6 +1270,9 @@ async function restartCaptureAfterGeneration(tabId) {
   if (!['capturing', 'awaiting-scroll', 'ready'].includes(session.phase)) {
     return {ok:false, error:'Нельзя перезапустить уже завершенный проход.'};
   }
+  if (session.pass > 1 && (session.completedPasses || 0) >= 1) {
+    return skipExtraPassAfterGeneration(tabId);
+  }
   if (session.generationRestartCount >= CHATGPT_MAX_GENERATION_RESTARTS_PER_PASS) {
     await failCaptureSession(session, new Error(
       'После перезагрузки ChatGPT снова начал генерацию ответа. '
@@ -1303,13 +1371,15 @@ async function cancelCaptureSession(tabId) {
 
   clearCaptureTimer(session);
   clearCursorGapTimer(session);
-  session.phase = 'cancelled';
-  appendCaptureEvent(session, 'CANCEL_REQUESTED', {
+  const alreadyFailed = session.phase === 'error';
+  session.phase = alreadyFailed ? 'error' : 'cancelled';
+  if (!alreadyFailed) appendCaptureEvent(session, 'CANCEL_REQUESTED', {
     pass: session.pass,
     captures: session.captures.length,
   });
+  const wasAttached = session.attached;
   await detachCaptureDebugger(session);
-  appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'cancelled' });
+  if (wasAttached && !alreadyFailed) appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'cancelled' });
   const state = serializeCaptureSession(session, { includeCaptures: false });
   captureSessions.delete(tabId);
   await removePreReloadTailSnapshot(tabId).catch(() => {});
@@ -1324,8 +1394,9 @@ async function releaseCaptureSession(tabId) {
 
   clearCaptureTimer(session);
   session.phase = 'released';
+  const wasAttached = session.attached;
   await detachCaptureDebugger(session);
-  appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'completed' });
+  if (wasAttached) appendCaptureEvent(session, 'DEBUGGER_DETACHED', { reason: 'completed' });
   const state = serializeCaptureSession(session, { includeCaptures: false });
   captureSessions.delete(tabId);
   await removePreReloadTailSnapshot(tabId).catch(() => {});
@@ -1447,6 +1518,9 @@ async function handleCaptureMessage(message, sender) {
   if (message.type === CAPTURE_GENERATION_RESTART_MESSAGE) {
     return restartCaptureAfterGeneration(tabId);
   }
+  if (message.type === CAPTURE_SKIP_EXTRA_PASS_MESSAGE) {
+    return skipExtraPassAfterGeneration(tabId);
+  }
   if (message.type === CAPTURE_SCROLL_STEP_MESSAGE) {
     return appendCaptureScrollStep(tabId, message);
   }
@@ -1523,6 +1597,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || message.type === CAPTURE_GET_STATE_MESSAGE
     || message.type === CAPTURE_CONTINUE_MESSAGE
     || message.type === CAPTURE_GENERATION_RESTART_MESSAGE
+    || message.type === CAPTURE_SKIP_EXTRA_PASS_MESSAGE
     || message.type === CAPTURE_SCROLL_STEP_MESSAGE
     || message.type === CAPTURE_CANCEL_MESSAGE
     || message.type === CAPTURE_RELEASE_MESSAGE

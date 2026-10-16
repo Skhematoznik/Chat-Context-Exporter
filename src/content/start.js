@@ -84,6 +84,7 @@
   const CAPTURE_CONTINUE_MESSAGE = 'chat-context-exporter:capture:continue';
   const CAPTURE_SCROLL_STEP_MESSAGE = 'chat-context-exporter:capture:scroll-step';
   const CAPTURE_GENERATION_RESTART_MESSAGE = 'chat-context-exporter:capture:generation-restart';
+  const CAPTURE_SKIP_EXTRA_PASS_MESSAGE = 'chat-context-exporter:capture:skip-extra-pass';
   const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
   const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
   const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -2195,18 +2196,43 @@
 
     if (config.responseProcessor === 'chatgpt-thread-json'
         && ['armed', 'capturing', 'awaiting-scroll', 'ready'].includes(state.phase)) {
-      const stable = await waitForChatGptGenerationToSettle('after-reload');
+      let stable;
+      try {
+        stable = await waitForChatGptGenerationToSettle('after-reload');
+      } catch (error) {
+        // On an optional pass, a full verified earlier pass is a safe fallback.
+        // On the mandatory pass a timeout remains a hard error.
+        if (state.pass > 1 && (state.completedPasses || 0) >= 1) {
+          log.write('CHATGPT_EXTRA_PASS_GENERATION_TIMEOUT', {
+            pass:state.pass, message:error instanceof Error ? error.message : String(error),
+          });
+          const skipped = await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE});
+          state = skipped.state;
+          stable = {observedActive:false};
+        } else throw error;
+      }
       if (!stable || runtime.aborted) return false;
       if (stable.observedActive) {
-        log.write('CHATGPT_GENERATION_RECAPTURE_REQUIRED', {
-          pass:state.pass, previousRestarts:state.generationRestartCount || 0,
-        });
-        const restart = await sendCaptureMessage({type:CAPTURE_GENERATION_RESTART_MESSAGE});
-        if (!restart.ok) {
-          throw new Error(restart.error || 'Не удалось обновить историю после завершения генерации.');
+        if (state.pass > 1 && (state.completedPasses || 0) >= 1) {
+          // Reloading again can itself resume an unsuccessful ChatGPT answer.
+          // Never risk a complete main-pass archive to chase an optional pass.
+          log.write('CHATGPT_EXTRA_PASS_GENERATION_DETECTED', {
+            pass:state.pass, completedPasses:state.completedPasses,
+          });
+          const skipped = await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE});
+          state = skipped.state;
+        } else if (state.phase !== 'ready' && !state.pageState?.pageSequence) {
+          // No initial page has been accepted, so there is nothing stale to recapture.
+          log.write('CHATGPT_GENERATION_SETTLED_BEFORE_CAPTURE', {pass:state.pass});
+        } else {
+          log.write('CHATGPT_GENERATION_RECAPTURE_REQUIRED', {
+            pass:state.pass, previousRestarts:state.generationRestartCount || 0,
+            reason:'initial-page-may-predate-generation-settle',
+          });
+          const restart = await sendCaptureMessage({type:CAPTURE_GENERATION_RESTART_MESSAGE});
+          if (!restart.ok) throw new Error(restart.error || 'Не удалось обновить историю после генерации.');
+          return true;
         }
-        // SW reloads after the response settled; the new content script resumes.
-        return true;
       }
     }
 
@@ -2300,6 +2326,14 @@
     runtime.panel.setStatus('Формирую файл...');
 
     const artifact = buildNetworkMarkdownArtifact(parsed.conversation);
+    const completedPasses = Math.max(1, Number(state.completedPasses) || 1);
+    if (state.captureWarning) {
+      log.write('EXPORT_WITH_WARNING', {
+        warning:state.captureWarning, completedPasses, requestedPasses:state.totalPasses,
+      });
+      artifact.content = '> **Предупреждение экспорта:** ' + state.captureWarning + '\n\n' + artifact.content;
+      runtime.panel.setStatus('Основной проход собран; дополнительная проверка не выполнена.');
+    }
     const workDurationMs = Date.now() - runtime.startedAt;
     const passAdditions = (diagnostics.passStats || []).map((item) => item.added);
 
@@ -2307,8 +2341,10 @@
       format: 'markdown',
       filename: artifact.filename,
       messages: finalStats.total,
-      passes: state.totalPasses,
-      extraPasses: Math.max(0, state.totalPasses - 1),
+      passes: completedPasses,
+      requestedPasses: state.totalPasses,
+      extraPasses: Math.max(0, completedPasses - 1),
+      skippedExtraPasses: state.skippedExtraPasses || 0,
       passAdditions,
       acquisitionMode: 'network',
       workDurationMs,
@@ -2318,7 +2354,7 @@
     if (currentSettings.autoSave) {
       runtime.panel.setStatus('Сохраняю файл...');
       await saveMarkdownArtifact(artifact, 'auto', { saveAs: false });
-      runtime.panel.setStatus('Сохранено.');
+      runtime.panel.setStatus(state.captureWarning ? 'Сохранено с предупреждением: доп. проход пропущен.' : 'Сохранено.');
       runtime.panel.setCloseTitle('Закрыть');
       runtime.panel.markDone();
 
@@ -2328,8 +2364,10 @@
         messages: finalStats.total,
         user: finalStats.user,
         assistant: finalStats.assistant,
-        passes: state.totalPasses,
-        extraPasses: Math.max(0, state.totalPasses - 1),
+        passes: completedPasses,
+        requestedPasses: state.totalPasses,
+        extraPasses: Math.max(0, completedPasses - 1),
+        skippedExtraPasses: state.skippedExtraPasses || 0,
         passAdditions,
         acquisitionMode: 'network',
         workDurationMs,
@@ -2348,12 +2386,13 @@
       return;
     }
 
-    runtime.panel.setStatus('Сбор завершен.');
+    runtime.panel.setStatus(state.captureWarning ? 'Сбор завершён с предупреждением.' : 'Сбор завершен.');
     runtime.panel.setCloseTitle('Закрыть');
     runtime.panel.markDone();
     log.write('WAITING_FOR_SAVE_DECISION', {
       messages: finalStats.total,
-      passes: state.totalPasses,
+      passes: completedPasses,
+      requestedPasses: state.totalPasses,
       filename: artifact.filename,
     });
 
@@ -2366,7 +2405,8 @@
       log.write('COMPLETED', {
         reason: 'markdown-save-cancelled',
         messages: finalStats.total,
-        passes: state.totalPasses,
+        passes: completedPasses,
+        requestedPasses: state.totalPasses,
         workDurationMs,
         workDuration: loggerModule.formatDuration(workDurationMs),
       });
@@ -2380,8 +2420,10 @@
       messages: finalStats.total,
       user: finalStats.user,
       assistant: finalStats.assistant,
-      passes: state.totalPasses,
-      extraPasses: Math.max(0, state.totalPasses - 1),
+      passes: completedPasses,
+      requestedPasses: state.totalPasses,
+      extraPasses: Math.max(0, completedPasses - 1),
+      skippedExtraPasses: state.skippedExtraPasses || 0,
       passAdditions,
       acquisitionMode: 'network',
       workDurationMs,
