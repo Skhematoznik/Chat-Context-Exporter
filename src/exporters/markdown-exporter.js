@@ -17,12 +17,14 @@
       .replace(/\n/g, '  \n');
   }
 
-  function escapeHeadingText(value) {
-    return String(value ?? '')
+  function escapeHeadingText(value, trim = true) {
+    const escaped = String(value ?? '')
       .replace(/\\/g, '\\\\')
       .replace(/([`*_\[\]<>~])/g, '\\$1')
-      .replace(/\n+/g, ' ')
-      .trim();
+      .replace(/\n+/g, ' ');
+    // Preserve spaces at inline-node boundaries in DOM-derived headings.
+    // Trim the assembled heading, never its individual text nodes.
+    return trim ? escaped.trim() : escaped;
   }
 
   function longestBacktickRun(value) {
@@ -53,7 +55,7 @@
     return (nodes || []).map((node) => {
       switch (node.type) {
         case 'text':
-          return headingContext ? escapeHeadingText(node.value) : escapeText(node.value);
+          return headingContext ? escapeHeadingText(node.value, false) : escapeText(node.value);
         case 'break':
           return '  \n';
         case 'strong':
@@ -135,6 +137,33 @@
     return output.join('\n');
   }
 
+  // Convert only GFM delimiter rows, preserving all table data and code examples.
+  // Some Markdown formatters require spaces around delimiters: | --- | ---: |.
+  function normalizeMarkdownTableDelimiters(value) {
+    const source = String(value ?? '');
+    let openFence = null;
+    return source.split('\n').map((line) => {
+      const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (fence) {
+        if (!openFence) {
+          openFence = fence[1];
+        } else if (fence[1][0] === openFence[0]
+            && fence[1].length >= openFence.length
+            && !fence[2].trim()) {
+          openFence = null;
+        }
+        return line;
+      }
+      // Indented code blocks are source examples, not tables to be reformatted.
+      if (openFence || /^(?: {4,}|\t)/.test(line)
+          || !/^[ \t]*\|(?:[ \t]*:?-{3,}:?[ \t]*\|){2,}[ \t]*$/.test(line)) {
+        return line;
+      }
+      const delimiters = line.trim().slice(1, -1).split('|').map((cell) => cell.trim());
+      return `| ${delimiters.join(' | ')} |`;
+    }).join('\n');
+  }
+
   function renderBlock(block) {
     switch (block.type) {
       case 'paragraph':
@@ -154,7 +183,7 @@
       case 'mathBlock':
         return `$$\n${String(block.value ?? '').trim()}\n$$`;
       case 'markdown':
-        return String(block.value ?? '').trim();
+        return normalizeMarkdownTableDelimiters(String(block.value ?? '').trim());
       default:
         return '';
     }
