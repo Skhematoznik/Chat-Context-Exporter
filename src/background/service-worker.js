@@ -46,6 +46,7 @@ const CAPTURE_CONTINUE_MESSAGE = 'chat-context-exporter:capture:continue';
 const CAPTURE_SCROLL_STEP_MESSAGE = 'chat-context-exporter:capture:scroll-step';
 const CAPTURE_GENERATION_RESTART_MESSAGE = 'chat-context-exporter:capture:generation-restart';
 const CAPTURE_SKIP_EXTRA_PASS_MESSAGE = 'chat-context-exporter:capture:skip-extra-pass';
+const CAPTURE_GENERATION_WAIT_MESSAGE = 'chat-context-exporter:capture:generation-wait';
 const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
 const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
 const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -511,6 +512,7 @@ async function beginCapturePass(session, { retryHttp403 = false } = {}) {
   }
   session.attemptEpoch += 1;
   session.phase = 'capturing';
+  session.generationGuardWaiting = false;
   session.error = null;
   session.currentPassCaptured = false;
   session.pagesCapturedInPass = 0;
@@ -1154,6 +1156,7 @@ async function startCaptureSession(tabId, message) {
     cursorGapTimer: null,
     drainingPages: false,
     generationRestartCount: 0,
+    generationGuardWaiting: false,
     completedPasses: 0,
     captureWarning: null,
     skippedExtraPasses: 0,
@@ -1184,6 +1187,7 @@ async function startCaptureSession(tabId, message) {
     autoClosePanel: Boolean(message.settings?.autoClosePanel),
     extraPassesEnabled: Boolean(message.settings?.extraPassesEnabled),
     extraPassCount: message.settings?.extraPassCount ?? null,
+    generationWaitSeconds: clampInteger(message.settings?.generationWaitSeconds, 30, 3600, 300),
     minDelayMs,
     maxDelayMs,
   });
@@ -1493,6 +1497,27 @@ async function handleLocalCacheSyncMessage(message, sender) {
   return { ok: false, error: 'Неизвестная команда локальной синхронизации.' };
 }
 
+async function updateGenerationGuardWait(tabId, waiting) {
+  const session = captureSessions.get(tabId);
+  if (!session) return {ok:false, error:'Сессия захвата не найдена.'};
+  if (session.responseProcessor !== 'chatgpt-thread-json') {
+    return {ok:false, error:'Ожидание генерации доступно только для ChatGPT Thread.'};
+  }
+  if (!['capturing', 'awaiting-scroll'].includes(session.phase)) {
+    return {ok:true, state:serializeCaptureSession(session)};
+  }
+  if (waiting === true && !session.generationGuardWaiting) {
+    session.generationGuardWaiting = true;
+    clearCaptureTimer(session);
+    appendCaptureEvent(session, 'CHATGPT_GENERATION_NETWORK_TIMEOUT_PAUSED', {pass:session.pass});
+  } else if (waiting === false && session.generationGuardWaiting) {
+    session.generationGuardWaiting = false;
+    if (session.phase === 'capturing') scheduleCaptureTimeout(session);
+    appendCaptureEvent(session, 'CHATGPT_GENERATION_NETWORK_TIMEOUT_RESUMED', {pass:session.pass});
+  }
+  return {ok:true, state:serializeCaptureSession(session)};
+}
+
 async function handleCaptureMessage(message, sender) {
   const tabId = sender.tab?.id;
   if (!tabId) {
@@ -1517,6 +1542,9 @@ async function handleCaptureMessage(message, sender) {
 
   if (message.type === CAPTURE_GENERATION_RESTART_MESSAGE) {
     return restartCaptureAfterGeneration(tabId);
+  }
+  if (message.type === CAPTURE_GENERATION_WAIT_MESSAGE) {
+    return updateGenerationGuardWait(tabId, message.waiting === true);
   }
   if (message.type === CAPTURE_SKIP_EXTRA_PASS_MESSAGE) {
     return skipExtraPassAfterGeneration(tabId);
@@ -1598,6 +1626,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     || message.type === CAPTURE_CONTINUE_MESSAGE
     || message.type === CAPTURE_GENERATION_RESTART_MESSAGE
     || message.type === CAPTURE_SKIP_EXTRA_PASS_MESSAGE
+    || message.type === CAPTURE_GENERATION_WAIT_MESSAGE
     || message.type === CAPTURE_SCROLL_STEP_MESSAGE
     || message.type === CAPTURE_CANCEL_MESSAGE
     || message.type === CAPTURE_RELEASE_MESSAGE

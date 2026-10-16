@@ -64,6 +64,7 @@
     operationStep: 0,
     stop: null,
     networkMode: false,
+    scrollGuardValidatedPass: null,
   };
 
   globalThis[APP_KEY] = runtime;
@@ -85,6 +86,7 @@
   const CAPTURE_SCROLL_STEP_MESSAGE = 'chat-context-exporter:capture:scroll-step';
   const CAPTURE_GENERATION_RESTART_MESSAGE = 'chat-context-exporter:capture:generation-restart';
   const CAPTURE_SKIP_EXTRA_PASS_MESSAGE = 'chat-context-exporter:capture:skip-extra-pass';
+  const CAPTURE_GENERATION_WAIT_MESSAGE = 'chat-context-exporter:capture:generation-wait';
   const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
   const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
   const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -94,7 +96,6 @@
   const LOCAL_CACHE_STABILITY_MATCHES = 2;
   const CHATGPT_NETWORK_FAST_SCROLL_SETTLE_MS = 120;
   const CHATGPT_NETWORK_RESPONSE_POLL_MS = 200;
-  const CHATGPT_GENERATION_MAX_WAIT_MS = 180_000;
   const CHATGPT_GENERATION_STABILITY_MS = 1800;
   const CHATGPT_GENERATION_POLL_MS = 350;
 
@@ -1219,12 +1220,14 @@
     return guard.isGenerating(document);
   }
 
-  async function waitForChatGptGenerationToSettle(phase) {
-    const deadline = Date.now() + CHATGPT_GENERATION_MAX_WAIT_MS;
+  async function waitForChatGptGenerationToSettle(phase, currentSettings) {
+    const waitSeconds = settings.clampGenerationWaitSeconds(currentSettings?.generationWaitSeconds);
+    const waitMs = waitSeconds * 1000;
+    const deadline = Date.now() + waitMs;
     let idleSince = null;
     let observedActive = false;
     let lastNotice = 0;
-    log.write('CHATGPT_GENERATION_GUARD_STARTED', {phase});
+    log.write('CHATGPT_GENERATION_GUARD_STARTED', {phase, waitSeconds});
     for (;;) {
       if (runtime.aborted) return null;
       const generating = isChatGptGenerating();
@@ -1244,8 +1247,8 @@
         }
       }
       if (Date.now() >= deadline) {
-        log.write('CHATGPT_GENERATION_GUARD_TIMEOUT', {phase, observedActive});
-        throw new Error('ChatGPT продолжает формировать ответ (кнопка «Остановить»). '
+        log.write('CHATGPT_GENERATION_GUARD_TIMEOUT', {phase, observedActive, waitSeconds});
+        throw new Error(`ChatGPT продолжает формировать ответ спустя ${waitSeconds} секунд (кнопка «Остановить»). `
           + 'Экспорт не запущен: дождитесь окончания ответа и повторите попытку.');
       }
       if (!await sleep(CHATGPT_GENERATION_POLL_MS, runtime.abortController.signal)) return null;
@@ -1314,10 +1317,48 @@
     return currentState;
   }
 
+  // A second guard at the actual scroll boundary catches Stop that appeared after
+  // the initial reload check (e.g. ChatGPT resumes generation asynchronously).
+  async function ensureGenerationSettledBeforeScroll(state, currentSettings) {
+    if (runtime.scrollGuardValidatedPass === state.pass && !isChatGptGenerating()) return state;
+    const wait = await guardedGenerationWait('before-scroll', currentSettings);
+    if (!wait || runtime.aborted) return null;
+    if (!wait.observedActive) {
+      runtime.scrollGuardValidatedPass = state.pass;
+      return state;
+    }
+    // An already-accepted initial JSON may predate the assistant's final answer.
+    // Do not scroll it as if it were an authoritative snapshot.
+    if (state.pass > 1 && (state.completedPasses || 0) >= 1) {
+      log.write('CHATGPT_EXTRA_PASS_GENERATION_DETECTED', {pass:state.pass, stage:'before-scroll'});
+      return (await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE})).state;
+    }
+    log.write('CHATGPT_GENERATION_RECAPTURE_REQUIRED', {pass:state.pass, stage:'before-scroll'});
+    const restarted = await sendCaptureMessage({type:CAPTURE_GENERATION_RESTART_MESSAGE});
+    if (!restarted.ok) throw new Error(restarted.error || 'Не удалось повторить сбор после генерации.');
+    runtime.scrollGuardValidatedPass = null;
+    return restarted.state;
+  }
+
+  async function guardedGenerationWait(phase, currentSettings) {
+    // The network response watchdog is independent of user-configurable Stop waiting.
+    // Pausing it prevents HTTP response-timeout while ChatGPT itself is generating.
+    const pause = await sendCaptureMessage({type:CAPTURE_GENERATION_WAIT_MESSAGE, waiting:true});
+    if (!pause?.ok) throw new Error(pause?.error || 'Не удалось приостановить сетевое ожидание.');
+    try {
+      return await waitForChatGptGenerationToSettle(phase, currentSettings);
+    } finally {
+      await sendCaptureMessage({type:CAPTURE_GENERATION_WAIT_MESSAGE, waiting:false}).catch(()=>{});
+    }
+  }
+
   async function advanceNetworkPagination(state, currentSettings) {
     if (!state || state.phase !== 'awaiting-scroll') {
       return state;
     }
+
+    state = await ensureGenerationSettledBeforeScroll(state, currentSettings);
+    if (!state || state.phase !== 'awaiting-scroll') return state;
 
     const previousPageSequence = Number(state.pageState?.pageSequence) || 0;
     const armResponse = await sendCaptureMessage({
@@ -1380,6 +1421,11 @@
         // The matching request disappeared without advancing the page (for example,
         // capture recovery). Resume scrolling only in that exceptional case.
       }
+
+      // Stop may reappear after the pre-scroll check, while a long list is
+      // being paginated. Never issue another scroll movement in that state.
+      currentState = await ensureGenerationSettledBeforeScroll(currentState, currentSettings);
+      if (!currentState || currentState.phase !== 'capturing') return currentState;
 
       if (!scrollContainer.isConnected) {
         scrollContainer = await waitForNetworkScroller();
@@ -2118,7 +2164,7 @@
       runtime.panel.setStatus('Подключаюсь...');
 
       if (config.responseProcessor === 'chatgpt-thread-json') {
-        const stable = await waitForChatGptGenerationToSettle('before-start');
+        const stable = await waitForChatGptGenerationToSettle('before-start', currentSettings);
         if (!stable || runtime.aborted) return false;
         runtime.panel.setStatus('Ответ ChatGPT стабилизировался. Подключаю сетевой захват...');
       }
@@ -2198,7 +2244,7 @@
         && ['armed', 'capturing', 'awaiting-scroll', 'ready'].includes(state.phase)) {
       let stable;
       try {
-        stable = await waitForChatGptGenerationToSettle('after-reload');
+        stable = await guardedGenerationWait('after-reload', currentSettings);
       } catch (error) {
         // On an optional pass, a full verified earlier pass is a safe fallback.
         // On the mandatory pass a timeout remains a hard error.
@@ -2213,7 +2259,7 @@
       }
       if (!stable || runtime.aborted) return false;
       if (stable.observedActive) {
-        if (state.pass > 1 && (state.completedPasses || 0) >= 1) {
+        if (state.pass > 1 && (state.completedPasses || 0) >= 1 && state.pageState?.pageSequence) {
           // Reloading again can itself resume an unsuccessful ChatGPT answer.
           // Never risk a complete main-pass archive to chase an optional pass.
           log.write('CHATGPT_EXTRA_PASS_GENERATION_DETECTED', {
@@ -2524,6 +2570,7 @@
       extraPassCount: currentSettings.extraPassCount,
       minDelayMs: currentSettings.minDelayMs,
       maxDelayMs: currentSettings.maxDelayMs,
+      generationWaitSeconds: currentSettings.generationWaitSeconds,
     });
 
     runtime.panel.setAssistant(runtime.adapter.displayName || runtime.adapter.id);

@@ -12,6 +12,7 @@
     autoClosePanel: true,
     extraPassesEnabled: false,
     extraPassCount: 1,
+    generationWaitSeconds: 300,
     minDelayMs: 100,
     maxDelayMs: 1000,
   });
@@ -34,6 +35,12 @@
     return Math.min(3, Math.max(1, Math.round(parsed)));
   }
 
+  function clampGenerationWaitSeconds(value, fallback = DEFAULT_SETTINGS.generationWaitSeconds) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(3600, Math.max(30, Math.round(parsed)));
+  }
+
   async function loadSettings() {
     try {
       const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
@@ -49,6 +56,7 @@
           ? stored.extraPassesEnabled
           : DEFAULT_SETTINGS.extraPassesEnabled,
         extraPassCount: clampExtraPassCount(stored.extraPassCount),
+        generationWaitSeconds: clampGenerationWaitSeconds(stored.generationWaitSeconds),
         minDelayMs: clampDelay(stored.minDelayMs, DEFAULT_SETTINGS.minDelayMs),
         maxDelayMs: clampDelay(stored.maxDelayMs, DEFAULT_SETTINGS.maxDelayMs),
       };
@@ -61,6 +69,7 @@
     DEFAULT_SETTINGS,
     clampDelay,
     clampExtraPassCount,
+    clampGenerationWaitSeconds,
     loadSettings,
   };
 })();

@@ -6,6 +6,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   autoClosePanel: true,
   extraPassesEnabled: false,
   extraPassCount: 1,
+  generationWaitSeconds: 300,
   minDelayMs: 100,
   maxDelayMs: 1000,
 });
@@ -19,6 +20,7 @@ const elements = {
   extraPassesEnabled: document.querySelector('#extraPassesEnabled'),
   extraPassCount: document.querySelector('#extraPassCount'),
   extraPassCountRow: document.querySelector('#extraPassCountRow'),
+  generationWaitSeconds: document.querySelector('#generationWaitSeconds'),
   minDelayMs: document.querySelector('#minDelayMs'),
   maxDelayMs: document.querySelector('#maxDelayMs'),
   reset: document.querySelector('#reset'),
@@ -76,6 +78,7 @@ function normalizeStoredSettings(stored) {
       ? stored.extraPassesEnabled
       : DEFAULT_SETTINGS.extraPassesEnabled,
     extraPassCount: readExtraPassCount(stored.extraPassCount),
+    generationWaitSeconds: clampNumber(stored.generationWaitSeconds, 30, 3600, DEFAULT_SETTINGS.generationWaitSeconds),
     minDelayMs: readDelayValue(stored.minDelayMs, DEFAULT_SETTINGS.minDelayMs),
     maxDelayMs: readDelayValue(stored.maxDelayMs, DEFAULT_SETTINGS.maxDelayMs),
   };
@@ -92,6 +95,7 @@ function render(settings) {
   elements.autoClosePanel.checked = settings.autoClosePanel;
   elements.extraPassesEnabled.checked = settings.extraPassesEnabled;
   elements.extraPassCount.value = String(settings.extraPassCount);
+  elements.generationWaitSeconds.value = String(settings.generationWaitSeconds);
   elements.minDelayMs.value = String(settings.minDelayMs);
   elements.maxDelayMs.value = String(settings.maxDelayMs);
   updateExtraPassControls(settings.extraPassesEnabled);
@@ -191,6 +195,11 @@ function attachHandlers() {
       min: 100,
       max: 60_000,
       fallback: DEFAULT_SETTINGS.maxDelayMs,
+    }],
+    ['generationWaitSeconds', elements.generationWaitSeconds, {
+      min: 30,
+      max: 3600,
+      fallback: DEFAULT_SETTINGS.generationWaitSeconds,
     }],
     ['extraPassCount', elements.extraPassCount, {
       min: 1,
