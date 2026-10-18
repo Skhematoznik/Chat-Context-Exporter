@@ -42,6 +42,10 @@
         const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
         return `HTTP 429: ожидание ${remaining} с. Собранные страницы сохранены.`;
       }
+      if (state.httpRetryStatus === 500) {
+        const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
+        return `HTTP 500: повтор через ${remaining} с. Собранные страницы сохранены.`;
+      }
       return 'HTTP 403: ожидаю повторной загрузки страницы...';
     }
     if (state.phase === 'waiting-next-pass') return 'Подготовка дополнительного прохода...';

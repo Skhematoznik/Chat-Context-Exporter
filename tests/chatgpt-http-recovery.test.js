@@ -56,7 +56,7 @@ function harness() {
     responseProcessor: 'chatgpt-thread-json', paginationMode: 'scroll-up-until-start',
     requestMethod: 'GET', requestResourceType: null,
     totalPasses: 1, minDelayMs: 100, maxDelayMs: 1000, timeoutMs: 60_000,
-    phase: 'capturing', pass: 1, attemptEpoch: 1, http403RetryCount: 0, http429RetryCount: 0,
+    phase: 'capturing', pass: 1, attemptEpoch: 1, http403RetryCount: 0, http429RetryCount: 0, http500RetryCount: 0,
     captures: [{pass: 1, requestId:'old-page'}, {pass: 0, requestId:'older-past-pass'}],
     currentPassCaptured: false, pagesCapturedInPass: 1,
     pageState: {pageSequence:1,startCursor:'cursor-1',hasPreviousPage:true},

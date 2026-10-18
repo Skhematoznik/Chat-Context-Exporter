@@ -100,9 +100,9 @@ test('early indicator is self-contained, uses existing DOM host ID and validates
   assert.match(code,/g\[RUNTIME_KEY\]\?\.running/);
   assert.match(code,/MutationObserver/);
   assert.doesNotMatch(JSON.stringify(manifest),/sidePanel|webNavigation|host_permissions/);
-  assert.equal(manifest.version,'1.3.3');
-  assert.equal(manifest.version_name,'1.3.3');
-  assert.equal(source('src/core/namespace.js').includes("version: '1.3.3'"),true);
+  assert.equal(manifest.version,'1.3.4');
+  assert.equal(manifest.version_name,'1.3.4');
+  assert.equal(source('src/core/namespace.js').includes("version: '1.3.4'"),true);
 });
 
 function panelHarness({conversationId = 'target-c',state = null,hostname = 'chatgpt.com'} = {}) {

@@ -1197,6 +1197,9 @@
         if (state.httpRetryStatus === 429) {
           const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
           runtime.panel.setStatus(`HTTP 429: лимит запросов сервера. Ожидание ${remaining} с; затем один повтор. Страницы сохранены.`);
+        } else if (state.httpRetryStatus === 500) {
+          const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
+          runtime.panel.setStatus(`HTTP 500: временная ошибка сервера. Повтор через ${remaining} с. Принятые страницы сохранены.`);
         } else {
           runtime.panel.setStatus('ChatGPT вернул HTTP 403. Через 2,5 с перезагружу страницу и повторю сбор...');
         }

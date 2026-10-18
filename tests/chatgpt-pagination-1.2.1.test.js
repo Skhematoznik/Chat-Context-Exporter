@@ -56,7 +56,7 @@ function createHarness({pageInfoList=pages} = {}) {
     pageState:null,pagesCapturedInPass:0,currentPassCaptured:false,
     currentPassTranscriptIds:new Set(),seenPageStartCursors:new Set(),acceptedRequestBeforeCursors:new Set(),bufferedPages:new Map(),
     bufferedPageBytes:0,cursorGapTimer:null,cursorGapStartedAt:null,drainingPages:false,
-    generationRestartCount:0,http403RetryCount:0,http429RetryCount:0,
+    generationRestartCount:0,http403RetryCount:0,http429RetryCount:0,http500RetryCount:0,
     captures:[],events:[],pendingRequests:new Map(),
     matchedRequests:0,timer:null,attached:true,detaching:false,error:null,
   };
@@ -362,4 +362,138 @@ test('second-pass repeated 429 falls back to the already completed first pass',a
   assert.equal(h.session.captures.length,1);
   assert.equal(h.session.captures[0].requestId,'complete-pass');
   assert.ok(h.session.events.some(e=>e.event==='CHATGPT_EXTRA_PASS_SKIPPED'));
+});
+
+// Candidate 1.3.4: HTTP 500 retry with the same in-memory cursor checkpoint
+// guarantees as 429, but a separate bounded retry budget and delay.
+function send500(h, { id = 'internal-error', before, headers = {} } = {}) {
+  const url = 'https://chatgpt.com/backend-api/conversations/thread/messages'
+    + (before ? `?before=${encodeURIComponent(before)}` : '');
+  h.handlers.event({tabId:19}, 'Network.requestWillBeSent', {
+    requestId: id, type: 'Fetch', request: {url, method: 'GET'},
+  });
+  h.handlers.event({tabId:19}, 'Network.responseReceived', {
+    requestId: id, response: {status:500, mimeType:'application/json', headers},
+  });
+}
+
+test('HTTP 500 preserves accepted pages, delays 30 seconds, revalidates and continues with no duplicates', async () => {
+  const h = createHarness();
+  for (let i=0;i<3;i++){h.sendPage(i);await h.flush();}
+  const accepted = h.session.captures.slice();
+  send500(h,{before:pages[2].startCursor});await h.flush();
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.equal(h.session.httpRetryStatus,500);
+  assert.equal(h.session.http500RetryCount,1);
+  assert.equal(h.session.captures.length,3);
+  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,0);
+  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_HTTP_500_RETRY_SCHEDULED'
+    &&e.details.delayMs===30000 &&e.details.preservedPages===3));
+  await h.expire(30000);
+  assert.equal(h.session.phase,'capturing');
+  assert.equal(h.session.http500Checkpoint.length,3);
+  assert.equal(h.session.pageState,null);
+  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
+  for(let i=0;i<3;i++){h.sendPage(i,`500-replayed-${i}`);await h.flush();}
+  assert.equal(h.session.http500Checkpoint,null);
+  assert.equal(h.session.captures.length,3);
+  for(let i=0;i<3;i++) assert.equal(h.session.captures[i],accepted[i]);
+  h.sendPage(3,'continued-after-500');await h.flush();
+  assert.equal(h.session.captures.length,4);
+  assert.equal(h.session.pagesCapturedInPass,4);
+  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_HTTP_500_CHECKPOINT_RESTORED'
+    &&e.details.preservedPages===3));
+});
+
+test('HTTP 500 respects bounded Retry-After and avoids overly late reload',async()=>{
+  const h=createHarness();h.sendPage(0);await h.flush();
+  send500(h,{before:pages[0].startCursor,headers:{'Retry-After':'75'}});await h.flush();
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.ok([...h.timers.values()].some(t=>t.ms===75000));
+  const g=createHarness();g.sendPage(0);await g.flush();
+  send500(g,{before:pages[0].startCursor,headers:{'Retry-After':'360'}});await g.flush();
+  assert.equal(g.session.phase,'error');
+  assert.match(g.session.error,/HTTP 500.*360/);
+  assert.ok(!g.commands.some(c=>c.method==='Page.reload'));
+});
+
+test('second HTTP 500 on required cursor fails mandatory pass without another reload',async()=>{
+  const h=createHarness();h.sendPage(0);await h.flush();
+  send500(h,{before:pages[0].startCursor});await h.flush();await h.expire(30000);
+  h.sendPage(0,'retry-page');await h.flush();
+  send500(h,{id:'500-again',before:pages[0].startCursor});await h.flush();
+  assert.equal(h.session.phase,'error');
+  assert.match(h.session.error,/HTTP 500/);
+  assert.match(h.session.error,/Экспорт не создан/);
+  assert.ok(!h.session.events.some(e=>e.event==='CAPTURE_READY'));
+  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
+});
+
+test('HTTP 500 in optional pass retries once, then retains full first pass without contradictory warning',async()=>{
+  const h=createHarness();h.session.pass=2;h.session.totalPasses=2;h.session.completedPasses=1;
+  h.session.captures.push({pass:1,requestId:'completed-main'});
+  h.sendPage(0);await h.flush();
+  send500(h,{before:pages[0].startCursor});await h.flush();await h.expire(30000);
+  h.sendPage(0,'500-extra-replay');await h.flush();
+  send500(h,{id:'500-extra-failed',before:pages[0].startCursor});await h.flush();
+  assert.equal(h.session.phase,'ready');
+  assert.equal(h.session.captures.length,1);
+  assert.equal(h.session.captures[0].requestId,'completed-main');
+  assert.match(h.session.captureWarning,/Сохранён только полный проход 1 из 2/);
+  assert.doesNotMatch(h.session.captureWarning,/Экспорт не создан|история неполная/);
+  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_EXTRA_PASS_SKIPPED'));
+  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
+});
+
+test('HTTP 500 checkpoint rejects modified historic page even when cursors remain the same',async()=>{
+  const h=createHarness();h.sendPage(0);await h.flush();h.sendPage(1);await h.flush();
+  send500(h,{before:pages[1].startCursor});await h.flush();await h.expire(30000);
+  h.sendPage(0,'tail-replayed-500');await h.flush();
+  h.session.http500Checkpoint[1].processed.messages[0].id='changed-history-500';
+  h.sendPage(1,'history-replayed-500');await h.flush();
+  assert.equal(h.session.phase,'error');
+  assert.match(h.session.error,/HTTP_500_CHECKPOINT_MISMATCH/);
+});
+
+test('unrelated HTTP 500 does not disturb pagination or schedule a recovery',async()=>{
+  const h=createHarness();h.sendPage(0);await h.flush();
+  send500(h,{before:null});await h.flush();
+  assert.equal(h.session.phase,'awaiting-scroll');
+  assert.equal(h.session.http500RetryCount || 0,0);
+  assert.ok(!h.commands.some(c=>c.method==='Page.reload'));
+});
+
+test('cancel during HTTP 500 pause disarms the delayed reload',async()=>{
+  const h=createHarness();h.sendPage(0);await h.flush();
+  send500(h,{before:pages[0].startCursor});await h.flush();
+  let respond;const done=new Promise(r=>respond=r);
+  h.handlers.message({type:'chat-context-exporter:capture:cancel'},{tab:{id:19}},respond);
+  await h.flush();await done;
+  assert.equal(h.session.phase,'cancelled');
+  assert.equal(h.timers.size,0);
+  assert.ok(!h.commands.some(c=>c.method==='Page.reload'));
+});
+
+test('HTTP 500 recovery can replay a full checkpoint and reach the beginning',async()=>{
+  const list=pages.map((p,i)=>({...p,hasPreviousPage:i!==pages.length-1}));
+  const h=createHarness({pageInfoList:list});
+  for(let i=0;i<3;i++){h.sendPage(i);await h.flush();}
+  send500(h,{before:list[2].startCursor});await h.flush();await h.expire(30000);
+  for(let i=0;i<list.length;i++){h.sendPage(i,`replay-all-500-${i}`);await h.flush();}
+  assert.equal(h.session.phase,'ready');
+  assert.equal(h.session.captures.length,list.length);
+  assert.equal(h.session.http500Checkpoint,null);
+  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_START_REACHED'));
+});
+
+test('HTTP 500 on initial page retries safely with zero preserved pages',async()=>{
+  const h=createHarness();
+  send500(h,{before:null});await h.flush();
+  assert.equal(h.session.phase,'waiting-http-retry');
+  await h.expire(30000);
+  assert.equal(h.session.phase,'capturing');
+  assert.equal(h.session.http500Checkpoint,null);
+  h.sendPage(0,'initial-500-retry-success');await h.flush();
+  assert.equal(h.session.captures.length,1);
+  assert.equal(h.session.pagesCapturedInPass,1);
 });

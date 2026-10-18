@@ -69,6 +69,10 @@ const CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS = 1;
 const CHATGPT_HTTP_429_MAX_RETRIES_PER_PASS = 1;
 const CHATGPT_HTTP_429_DEFAULT_COOLDOWN_MS = 120_000;
 const CHATGPT_HTTP_429_MAX_COOLDOWN_MS = 15 * 60_000;
+// A transient HTTP 500 may be retried once per pass. Do not retry rapidly.
+const CHATGPT_HTTP_500_MAX_RETRIES_PER_PASS = 1;
+const CHATGPT_HTTP_500_DEFAULT_RETRY_DELAY_MS = 30_000;
+const CHATGPT_HTTP_500_MAX_RETRY_DELAY_MS = 5 * 60_000;
 const CHATGPT_CURSOR_GAP_TIMEOUT_MS = 15000;
 const CHATGPT_MAX_BUFFERED_PAGES = 24;
 const CHATGPT_MAX_BUFFERED_PAGE_BYTES = 24 * 1024 * 1024;
@@ -219,7 +223,7 @@ function getCurrentPassCheckpoint(session) {
     const page = pages[i];
     if (page.pageSequence !== i + 1 || !page.processed?.pageInfo?.startCursor
         || (i > 0 && page.requestBefore !== pages[i - 1].processed.pageInfo.startCursor)) {
-      throw new Error('Нарушена целостность сохранённых страниц перед восстановлением HTTP 429.');
+      throw new Error('Нарушена целостность сохранённых страниц перед восстановлением HTTP.');
     }
   }
   return pages;
@@ -302,6 +306,10 @@ function serializeCaptureSession(session, { includeCaptures = false, includeEven
     httpRetryStatus: session.httpRetryStatus || null,
     httpRetryAt: session.httpRetryAt || null,
     http429CheckpointPages: session.http429Checkpoint?.length || 0,
+    http500RetryCount: session.http500RetryCount || 0,
+    http500MaxRetries: session.responseProcessor === 'chatgpt-thread-json'
+      ? CHATGPT_HTTP_500_MAX_RETRIES_PER_PASS : 0,
+    http500CheckpointPages: session.http500Checkpoint?.length || 0,
     preReloadTail: session.preReloadTailSnapshot ? {
       captured: true,
       source: session.preReloadTailSnapshot.source,
@@ -503,6 +511,8 @@ async function skipIncompleteExtraPass(session, error, stage) {
   session.cursorGapStartedAt = null;
   session.skippedExtraPasses = Math.max(0, session.totalPasses - session.completedPasses);
   const cause = error instanceof Error ? error.message : String(error);
+  session.http429Checkpoint = null;
+  session.http500Checkpoint = null;
   session.captureWarning = `Дополнительная проверка истории не выполнена (${cause}). `
     + `Сохранён только полный проход ${session.completedPasses} из ${session.totalPasses}.`;
   session.error = null;
@@ -572,12 +582,12 @@ function scheduleCaptureTimeout(session) {
   }, session.timeoutMs);
 }
 
-async function beginCapturePass(session, { retryHttp403 = false, retryHttp429 = false } = {}) {
+async function beginCapturePass(session, { retryHttp403 = false, retryHttp429 = false, retryHttp500 = false } = {}) {
   if (!session || session.phase === 'cancelled' || session.phase === 'released' || session.phase === 'error') {
     return;
   }
-  if ((retryHttp403 || retryHttp429) && session.phase !== 'waiting-http-retry') return;
-  if (retryHttp403 && retryHttp429) return;
+  if ((retryHttp403 || retryHttp429 || retryHttp500) && session.phase !== 'waiting-http-retry') return;
+  if (Number(retryHttp403) + Number(retryHttp429) + Number(retryHttp500) > 1) return;
   session.httpRetryStatus = null;
   session.httpRetryAt = null;
   if (retryHttp403) {
@@ -605,12 +615,27 @@ async function beginCapturePass(session, { retryHttp403 = false, retryHttp429 = 
       preservedPages: session.http429Checkpoint.length,
       previousPassCapturesPreserved: session.captures.filter(c => c.pass < session.pass).length,
     });
+  } else if (retryHttp500) {
+    try {
+      const checkpoint = getCurrentPassCheckpoint(session);
+      session.http500Checkpoint = checkpoint.length ? checkpoint : null;
+    } catch (error) {
+      await failCaptureSession(session, error, 'http-500-checkpoint');
+      return;
+    }
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_500_RETRY_STARTED', {
+      pass: session.pass, retry: session.http500RetryCount,
+      preservedPages: session.http500Checkpoint?.length || 0,
+      previousPassCapturesPreserved: session.captures.filter(c => c.pass < session.pass).length,
+    });
   } else {
     session.pass += 1;
     session.http403RetryCount = 0;
     session.http429RetryCount = 0;
+    session.http500RetryCount = 0;
   }
   if (!retryHttp429) session.http429Checkpoint = null;
+  if (!retryHttp500) session.http500Checkpoint = null;
   session.attemptEpoch += 1;
   session.phase = 'capturing';
   session.generationGuardWaiting = false;
@@ -625,10 +650,10 @@ async function beginCapturePass(session, { retryHttp403 = false, retryHttp429 = 
   session.cursorGapStartedAt = null;
   session.drainingPages = false;
   clearCursorGapTimer(session);
-  if (!retryHttp403 && !retryHttp429) session.generationRestartCount = 0;
+  if (!retryHttp403 && !retryHttp429 && !retryHttp500) session.generationRestartCount = 0;
   session.currentPassTranscriptIds = new Set();
   session.pendingRequests.clear();
-  if (!retryHttp403 && !retryHttp429) {
+  if (!retryHttp403 && !retryHttp429 && !retryHttp500) {
     appendCaptureEvent(session, 'PASS_STARTED', {
       pass: session.pass,
       totalPasses: session.totalPasses,
@@ -639,10 +664,12 @@ async function beginCapturePass(session, { retryHttp403 = false, retryHttp429 = 
   appendCaptureEvent(session, 'PAGE_RELOAD_REQUESTED', {
     pass: session.pass,
     totalPasses: session.totalPasses,
-    reason: retryHttp403 ? 'http-403-recovery' : retryHttp429 ? 'http-429-cooldown-recovery' : 'normal-pass',
+    reason: retryHttp403 ? 'http-403-recovery' : retryHttp429 ? 'http-429-cooldown-recovery'
+      : retryHttp500 ? 'http-500-recovery' : 'normal-pass',
     http403RetryCount: session.http403RetryCount,
     http429RetryCount: session.http429RetryCount,
-    preservedPages: session.http429Checkpoint?.length || 0,
+    http500RetryCount: session.http500RetryCount,
+    preservedPages: session.http429Checkpoint?.length || session.http500Checkpoint?.length || 0,
   });
 
   scheduleCaptureTimeout(session);
@@ -767,6 +794,40 @@ async function handleCaptureHttpError(session, requestId, requestInfo) {
     return;
   }
 
+  if (status === 500 && isChatGptPage
+      && session.http500RetryCount < CHATGPT_HTTP_500_MAX_RETRIES_PER_PASS) {
+    const serverRetryAfterMs = getRetryAfterMs(requestInfo.responseHeaders);
+    if (serverRetryAfterMs != null && serverRetryAfterMs > CHATGPT_HTTP_500_MAX_RETRY_DELAY_MS) {
+      await failCaptureSession(session, new Error(
+        `HTTP 500: сервер запросил ожидание ${Math.ceil(serverRetryAfterMs / 1000)} секунд. `
+        + 'Автоматическая перезагрузка отменена: ожидание превышает безопасный лимит. '
+        + 'Попробуйте повторить экспорт позже.',
+      ), 'http-500-retry-after-too-long');
+      return;
+    }
+    const delayMs = Math.max(CHATGPT_HTTP_500_DEFAULT_RETRY_DELAY_MS, serverRetryAfterMs || 0);
+    session.http500RetryCount += 1;
+    clearCaptureTimer(session);
+    session.phase = 'waiting-http-retry';
+    session.httpRetryStatus = 500;
+    session.httpRetryAt = nowMs() + delayMs;
+    session.pendingRequests.clear();
+    clearCursorGapTimer(session);
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_500_RETRY_SCHEDULED', {
+      pass: session.pass, retry: session.http500RetryCount,
+      maxRetries: CHATGPT_HTTP_500_MAX_RETRIES_PER_PASS,
+      delayMs, serverRetryAfterMs,
+      beforeCursor: requestBefore,
+      preservedPages: session.captures.filter(c => c.pass === session.pass).length,
+    });
+    session.timer = setTimeout(() => {
+      session.timer = null;
+      void beginCapturePass(session, { retryHttp500: true });
+    }, delayMs);
+    await notifyCaptureSession(session);
+    return;
+  }
+
   if (status === 403 && isChatGptPage
       && session.http403RetryCount < CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS) {
     session.http403RetryCount += 1;
@@ -798,10 +859,16 @@ async function handleCaptureHttpError(session, requestId, requestInfo) {
     ? ' Повторная попытка через 2,5 секунды и перезагрузка страницы не помогли.'
     : status === 429 && isChatGptPage && session.http429RetryCount > 0
       ? ' После паузы и единственной повторной перезагрузки ограничение сервера сохранилось.'
-      : '';
+      : status === 500 && isChatGptPage && session.http500RetryCount > 0
+        ? ' После паузы и единственной повторной перезагрузки ошибка сервера повторилась.'
+        : '';
+  const hasCompletePass = session.responseProcessor === 'chatgpt-thread-json'
+    && session.pass > 1 && (session.completedPasses || 0) > 0;
   await failCaptureSession(session, new Error(
-    `${description}${retryNote} Экспорт не создан: история неполная. `
-    + 'Попробуйте обновить страницу и повторить экспорт позже.',
+    `${description}${retryNote}${hasCompletePass ? '' : ' '}`
+    + (hasCompletePass
+      ? ''
+      : 'Экспорт не создан: история неполная. Попробуйте обновить страницу и повторить экспорт позже.'),
   ), 'http-response');
 }
 
@@ -872,14 +939,16 @@ async function acceptPaginatedPage(session, item) {
   const pageSequence = session.pagesCapturedInPass + 1;
   const pageInfo = processed.pageInfo;
   if (pageInfo.startCursor && session.seenPageStartCursors.has(pageInfo.startCursor)) return;
-  const checkpoint = session.http429Checkpoint?.[pageSequence - 1] || null;
+  const checkpointStatus = session.http500Checkpoint ? 500 : session.http429Checkpoint ? 429 : null;
+  const checkpointPages = checkpointStatus === 500 ? session.http500Checkpoint : session.http429Checkpoint;
+  const checkpoint = checkpointPages?.[pageSequence - 1] || null;
   if (checkpoint && !checkpointPageIdentityMatches(checkpoint, item)) {
-    throw new Error('HTTP_429_CHECKPOINT_MISMATCH: после перезагрузки изменилась '
+    throw new Error(`HTTP_${checkpointStatus}_CHECKPOINT_MISMATCH: после перезагрузки изменилась `
       + `курсорная идентичность страницы ${pageSequence}. Объединение разных версий истории запрещено.`);
   }
   if (checkpoint && !checkpointPageContentMatches(checkpoint, item)) {
     if (pageSequence !== 1 || requestBefore) {
-      throw new Error('HTTP_429_CHECKPOINT_MISMATCH: изменилось содержимое ранее '
+      throw new Error(`HTTP_${checkpointStatus}_CHECKPOINT_MISMATCH: изменилось содержимое ранее `
         + `принятой исторической страницы ${pageSequence}. Безопасное объединение запрещено.`);
     }
     // The tail may contain the assistant answer finalized during the cooldown.
@@ -888,7 +957,7 @@ async function acceptPaginatedPage(session, item) {
     checkpoint.bodyBytes = bodyBytes;
     checkpoint.requestId = requestId;
     checkpoint.status = requestInfo.status;
-    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_TAIL_REFRESHED', {
+    appendCaptureEvent(session, `CHATGPT_THREAD_HTTP_${checkpointStatus}_TAIL_REFRESHED`, {
       pass: session.pass, pageSequence, startCursor: pageInfo.startCursor,
       reason: 'same-cursors-new-tail-content',
     });
@@ -900,15 +969,16 @@ async function acceptPaginatedPage(session, item) {
     if (typeof message?.id === 'string' && message.id) session.currentPassTranscriptIds.add(message.id);
   }
   if (checkpoint) {
-    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_CHECKPOINT_VERIFIED', {
+    appendCaptureEvent(session, `CHATGPT_THREAD_HTTP_${checkpointStatus}_CHECKPOINT_VERIFIED`, {
       pass: session.pass, pageSequence, startCursor: pageInfo.startCursor,
       preservedRequestId: checkpoint.requestId,
     });
-    if (pageSequence === session.http429Checkpoint.length) {
-      appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_CHECKPOINT_RESTORED', {
+    if (pageSequence === checkpointPages.length) {
+      appendCaptureEvent(session, `CHATGPT_THREAD_HTTP_${checkpointStatus}_CHECKPOINT_RESTORED`, {
         pass: session.pass, preservedPages: pageSequence,
       });
-      session.http429Checkpoint = null;
+      if (checkpointStatus === 500) session.http500Checkpoint = null;
+      else session.http429Checkpoint = null;
     }
   } else {
     session.captures.push({
@@ -1342,6 +1412,8 @@ async function startCaptureSession(tabId, message) {
     http403RetryCount: 0,
     http429RetryCount: 0,
     http429Checkpoint: null,
+    http500RetryCount: 0,
+    http500Checkpoint: null,
     httpRetryStatus: null,
     httpRetryAt: null,
     matchedRequests: 0,
@@ -1465,9 +1537,9 @@ async function restartCaptureAfterGeneration(tabId) {
     ), 'generation-unstable');
     return {ok:false, error:session.error, state:serializeCaptureSession(session)};
   }
-  if (session.http429Checkpoint?.length) {
+  if (session.http429Checkpoint?.length || session.http500Checkpoint?.length) {
     await failCaptureSession(session, new Error(
-      'После восстановления HTTP 429 ChatGPT продолжил генерацию. '
+      'После восстановления HTTP 429/500 ChatGPT продолжил генерацию. '
       + 'Ранее сохранённые страницы могли измениться; автоматическое объединение запрещено.',
     ), 'http-429-generation-changed');
     return {ok:false, error:session.error, state:serializeCaptureSession(session)};
