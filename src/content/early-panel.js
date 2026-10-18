@@ -108,24 +108,58 @@
       <style>
         :host { all: initial; }
         * {box-sizing:border-box;}
-        .panel {border:1px solid rgba(255,255,255,.18);border-radius:12px;
-          background:rgba(24,24,28,.96);color:#fff;
-          box-shadow:0 12px 36px rgba(0,0,0,.34);overflow:hidden;}
-        header {padding:10px 12px;background:#202228;font:700 14px Arial,sans-serif;
-          border-bottom:1px solid rgba(255,255,255,.08);}
-        .body {padding:12px;font:13px/1.45 Arial,sans-serif;}
-        .timer {font-weight:700;font-variant-numeric:tabular-nums;margin-bottom:8px;}
-        .status {margin:0 0 9px;}
-        .meta {color:#cfcfd5;font-size:12px;}
-        .meta span {color:#fff;}
-        .progress {height:4px;margin-top:12px;border-radius:4px;
-          background:rgba(255,255,255,.12);overflow:hidden;}
-        .progress div {width:35%;height:100%;background:#aeb4bf;
-          animation:travel 1.2s ease-in-out infinite alternate;}
+        .panel {
+          width: 100%;
+          border: 1px solid rgba(255, 255, 255, 0.18);
+          border-radius: 12px;
+          background: rgba(24, 24, 28, 0.96);
+          color: #fff;
+          box-shadow: 0 12px 36px rgba(0, 0, 0, 0.34);
+          overflow: hidden;
+          backdrop-filter: blur(10px);
+        }
+        .header {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 10px 12px;
+          background: #202228;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .icon { width: 28px; height: 28px; flex: 0 0 auto; display: block; }
+        .title { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 700; line-height: 1.2; }
+        .body { padding: 12px; font: 13px/1.45 Arial, sans-serif; }
+        .timer { font-weight: 700; font-variant-numeric: tabular-nums; margin-bottom: 8px; }
+        .status { margin: 0 0 10px; }
+        .meta { color: #cfcfd5; font-size: 12px; }
+        .meta span { color: #fff; }
+        .progress {
+          height: 4px;
+          margin-top: 12px;
+          border-radius: 4px;
+          background: rgba(255, 255, 255, 0.12);
+          overflow: hidden;
+        }
+        .progress div {
+          width: 35%;
+          height: 100%;
+          background: #aeb4bf;
+          animation: travel 1.2s ease-in-out infinite alternate;
+        }
         @keyframes travel {from{transform:translateX(-90%)}to{transform:translateX(280%)}}
       </style>
       <section class="panel" role="status" aria-live="polite">
-        <header>Chat Context Exporter</header>
+        <header class="header">
+          <svg class="icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+            <path fill="#fff" d="M11 8h42a7 7 0 0 1 7 7v28a7 7 0 0 1-7 7H29L16 59v-9h-5a7 7 0 0 1-7-7V15a7 7 0 0 1 7-7Z"/>
+            <rect x="15" y="20" width="34" height="22" rx="10" fill="#d6008f"/>
+            <rect x="21" y="26" width="5" height="9" rx="2.5" fill="#fff"/>
+            <rect x="38" y="26" width="5" height="9" rx="2.5" fill="#fff"/>
+            <rect x="29" y="13" width="6" height="8" rx="3" fill="#d6008f"/>
+            <circle cx="32" cy="11" r="4" fill="#d6008f"/>
+          </svg>
+          <div class="title">Chat Context Exporter</div>
+        </header>
         <div class="body">
           <div class="timer">Время: <span class="elapsed">00:00:00</span></div>
           <p class="status">Страница загружается. Экспорт работает...</p>
