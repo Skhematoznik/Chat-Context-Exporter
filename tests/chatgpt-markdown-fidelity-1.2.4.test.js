@@ -91,6 +91,6 @@ test('documentation: the production DOM serializer uses whitespace-aware Markdow
   assert.match(fs.readFileSync(path.join(root,'src/core/dom/rich-text-parser.js'),'utf8'),
     /value = normalizeText\(node\.nodeValue\)/);
   const manifest = JSON.parse(fs.readFileSync(path.join(root,'manifest.json'),'utf8'));
-  assert.equal(manifest.version, '1.2');
-  assert.equal(manifest.version_name, '1.2');
+  assert.equal(manifest.version, '1.3');
+  assert.equal(manifest.version_name, '1.3');
 });

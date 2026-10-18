@@ -37,9 +37,9 @@ test('settings page exposes editable seconds for 30..3600 and reset to 300',()=>
   assert.match(read('src/options/options.js'),/generationWaitSeconds: 300/);
   assert.match(read('src/options/options.js'),/\['generationWaitSeconds', elements\.generationWaitSeconds/);
   assert.match(read('src/options/options.js'),/chrome\.storage\.local\.set\(\{ \.\.\.DEFAULT_SETTINGS \}\)/);
-  assert.equal(manifest.version,'1.2');
-  assert.equal(manifest.version_name,'1.2');
-  assert.match(read('src/core/namespace.js'),/version: '1\.2'/);
+  assert.equal(manifest.version,'1.3');
+  assert.equal(manifest.version_name,'1.3');
+  assert.match(read('src/core/namespace.js'),/version: '1\.3'/);
 });
 
 test('Stop wait is bound to configured seconds on first, after-reload and before-scroll checks',()=>{

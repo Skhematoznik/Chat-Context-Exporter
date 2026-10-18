@@ -61,6 +61,11 @@ const SAVE_REQUEST_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_CAPTURE_TIMEOUT_MS = 60_000;
 const CHATGPT_HTTP_403_RETRY_DELAY_MS = 2500;
 const CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS = 1;
+// HTTP 429 is a server-side rate limit, not an authorization challenge.
+// Respect Retry-After and never perform a rapid or unbounded reload loop.
+const CHATGPT_HTTP_429_MAX_RETRIES_PER_PASS = 1;
+const CHATGPT_HTTP_429_DEFAULT_COOLDOWN_MS = 120_000;
+const CHATGPT_HTTP_429_MAX_COOLDOWN_MS = 15 * 60_000;
 const CHATGPT_CURSOR_GAP_TIMEOUT_MS = 15000;
 const CHATGPT_MAX_BUFFERED_PAGES = 24;
 const CHATGPT_MAX_BUFFERED_PAGE_BYTES = 24 * 1024 * 1024;
@@ -193,6 +198,44 @@ function getRequestBeforeCursor(url) {
   }
 }
 
+function getRetryAfterMs(headers, currentTimeMs = nowMs()) {
+  if (!headers || typeof headers !== 'object') return null;
+  const entry = Object.entries(headers).find(([name]) => name.toLowerCase() === 'retry-after');
+  if (!entry) return null;
+  const value = String(entry[1] ?? '').trim();
+  if (!value) return null;
+  if (/^\d+(?:\.\d+)?$/.test(value)) return Math.ceil(Number(value) * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - currentTimeMs) : null;
+}
+
+function getCurrentPassCheckpoint(session) {
+  const pages = session.captures.filter((capture) => capture.pass === session.pass);
+  for (let i = 0; i < pages.length; i += 1) {
+    const page = pages[i];
+    if (page.pageSequence !== i + 1 || !page.processed?.pageInfo?.startCursor
+        || (i > 0 && page.requestBefore !== pages[i - 1].processed.pageInfo.startCursor)) {
+      throw new Error('Нарушена целостность сохранённых страниц перед восстановлением HTTP 429.');
+    }
+  }
+  return pages;
+}
+
+function checkpointPageIdentityMatches(checkpoint, incoming) {
+  const oldInfo = checkpoint?.processed?.pageInfo;
+  const newInfo = incoming?.processed?.pageInfo;
+  if (!oldInfo || !newInfo || checkpoint.requestBefore !== incoming.requestBefore) return false;
+  for (const field of ['startCursor', 'endCursor', 'hasPreviousPage', 'hasNextPage']) {
+    if (oldInfo[field] !== newInfo[field]) return false;
+  }
+  return true;
+}
+
+function checkpointPageContentMatches(checkpoint, incoming) {
+  return JSON.stringify(checkpoint.processed.messages || [])
+    === JSON.stringify(incoming.processed.messages || []);
+}
+
 function getCurrentPaginationRequest(session) {
   if (
     !session
@@ -248,6 +291,12 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
     http403MaxRetries: session.responseProcessor === 'chatgpt-thread-json'
       ? CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS
       : 0,
+    http429RetryCount: session.http429RetryCount || 0,
+    http429MaxRetries: session.responseProcessor === 'chatgpt-thread-json'
+      ? CHATGPT_HTTP_429_MAX_RETRIES_PER_PASS : 0,
+    httpRetryStatus: session.httpRetryStatus || null,
+    httpRetryAt: session.httpRetryAt || null,
+    http429CheckpointPages: session.http429Checkpoint?.length || 0,
     preReloadTail: session.preReloadTailSnapshot ? {
       captured: true,
       source: session.preReloadTailSnapshot.source,
@@ -487,14 +536,14 @@ function scheduleCaptureTimeout(session) {
   }, session.timeoutMs);
 }
 
-async function beginCapturePass(session, { retryHttp403 = false } = {}) {
+async function beginCapturePass(session, { retryHttp403 = false, retryHttp429 = false } = {}) {
   if (!session || session.phase === 'cancelled' || session.phase === 'released' || session.phase === 'error') {
     return;
   }
-  if (retryHttp403 && session.phase !== 'waiting-http-retry') {
-    return;
-  }
-
+  if ((retryHttp403 || retryHttp429) && session.phase !== 'waiting-http-retry') return;
+  if (retryHttp403 && retryHttp429) return;
+  session.httpRetryStatus = null;
+  session.httpRetryAt = null;
   if (retryHttp403) {
     // A failed pagination attempt is incomplete: discard only this pass.
     // Completed earlier passes and the authoritative pre-reload tail remain intact.
@@ -506,10 +555,26 @@ async function beginCapturePass(session, { retryHttp403 = false } = {}) {
       discardedCaptures: discarded - session.captures.length,
       previousPassCapturesPreserved: session.captures.length,
     });
+  } else if (retryHttp429) {
+    try {
+      // Keep the accepted pages and their parsed contents. Replay only verifies
+      // the already-accepted prefix after reload; it must not duplicate captures.
+      session.http429Checkpoint = getCurrentPassCheckpoint(session);
+    } catch (error) {
+      await failCaptureSession(session, error, 'http-429-checkpoint');
+      return;
+    }
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_RETRY_STARTED', {
+      pass: session.pass, retry: session.http429RetryCount,
+      preservedPages: session.http429Checkpoint.length,
+      previousPassCapturesPreserved: session.captures.filter(c => c.pass < session.pass).length,
+    });
   } else {
     session.pass += 1;
     session.http403RetryCount = 0;
+    session.http429RetryCount = 0;
   }
+  if (!retryHttp429) session.http429Checkpoint = null;
   session.attemptEpoch += 1;
   session.phase = 'capturing';
   session.generationGuardWaiting = false;
@@ -524,10 +589,10 @@ async function beginCapturePass(session, { retryHttp403 = false } = {}) {
   session.cursorGapStartedAt = null;
   session.drainingPages = false;
   clearCursorGapTimer(session);
-  if (!retryHttp403) session.generationRestartCount = 0;
+  if (!retryHttp403 && !retryHttp429) session.generationRestartCount = 0;
   session.currentPassTranscriptIds = new Set();
   session.pendingRequests.clear();
-  if (!retryHttp403) {
+  if (!retryHttp403 && !retryHttp429) {
     appendCaptureEvent(session, 'PASS_STARTED', {
       pass: session.pass,
       totalPasses: session.totalPasses,
@@ -538,8 +603,10 @@ async function beginCapturePass(session, { retryHttp403 = false } = {}) {
   appendCaptureEvent(session, 'PAGE_RELOAD_REQUESTED', {
     pass: session.pass,
     totalPasses: session.totalPasses,
-    reason: retryHttp403 ? 'http-403-recovery' : 'normal-pass',
+    reason: retryHttp403 ? 'http-403-recovery' : retryHttp429 ? 'http-429-cooldown-recovery' : 'normal-pass',
     http403RetryCount: session.http403RetryCount,
+    http429RetryCount: session.http429RetryCount,
+    preservedPages: session.http429Checkpoint?.length || 0,
   });
 
   scheduleCaptureTimeout(session);
@@ -630,11 +697,47 @@ async function handleCaptureHttpError(session, requestId, requestInfo) {
     pageSequence: session.pageState?.pageSequence || null,
   });
 
+  if (status === 429 && isChatGptPage
+      && session.http429RetryCount < CHATGPT_HTTP_429_MAX_RETRIES_PER_PASS) {
+    const serverRetryAfterMs = getRetryAfterMs(requestInfo.responseHeaders);
+    if (serverRetryAfterMs != null && serverRetryAfterMs > CHATGPT_HTTP_429_MAX_COOLDOWN_MS) {
+      await failCaptureSession(session, new Error(
+        `HTTP 429: сервер запросил ожидание ${Math.ceil(serverRetryAfterMs / 1000)} секунд. `
+        + 'Автоматическая перезагрузка отменена: длительное ограничение частоты запросов. '
+        + 'Дождитесь разрешённого времени и повторите экспорт вручную.',
+      ), 'http-429-retry-after-too-long');
+      return;
+    }
+    const delayMs = Math.max(CHATGPT_HTTP_429_DEFAULT_COOLDOWN_MS, serverRetryAfterMs || 0);
+    session.http429RetryCount += 1;
+    clearCaptureTimer(session);
+    session.phase = 'waiting-http-retry';
+    session.httpRetryStatus = 429;
+    session.httpRetryAt = nowMs() + delayMs;
+    session.pendingRequests.clear();
+    clearCursorGapTimer(session);
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_RETRY_SCHEDULED', {
+      pass: session.pass, retry: session.http429RetryCount,
+      maxRetries: CHATGPT_HTTP_429_MAX_RETRIES_PER_PASS,
+      delayMs, serverRetryAfterMs,
+      beforeCursor: requestBefore,
+      preservedPages: session.captures.filter(c => c.pass === session.pass).length,
+    });
+    session.timer = setTimeout(() => {
+      session.timer = null;
+      void beginCapturePass(session, { retryHttp429: true });
+    }, delayMs);
+    await notifyCaptureSession(session);
+    return;
+  }
+
   if (status === 403 && isChatGptPage
       && session.http403RetryCount < CHATGPT_HTTP_403_MAX_RETRIES_PER_PASS) {
     session.http403RetryCount += 1;
     clearCaptureTimer(session);
     session.phase = 'waiting-http-retry';
+    session.httpRetryStatus = 403;
+    session.httpRetryAt = nowMs() + CHATGPT_HTTP_403_RETRY_DELAY_MS;
     session.pendingRequests.clear();
     clearCursorGapTimer(session);
     appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_403_RETRY_SCHEDULED', {
@@ -657,7 +760,9 @@ async function handleCaptureHttpError(session, requestId, requestInfo) {
     : `Сервер вернул HTTP ${status} при получении истории диалога.`;
   const retryNote = status === 403 && isChatGptPage
     ? ' Повторная попытка через 2,5 секунды и перезагрузка страницы не помогли.'
-    : '';
+    : status === 429 && isChatGptPage && session.http429RetryCount > 0
+      ? ' После паузы и единственной повторной перезагрузки ограничение сервера сохранилось.'
+      : '';
   await failCaptureSession(session, new Error(
     `${description}${retryNote} Экспорт не создан: история неполная. `
     + 'Попробуйте обновить страницу и повторить экспорт позже.',
@@ -731,25 +836,59 @@ async function acceptPaginatedPage(session, item) {
   const pageSequence = session.pagesCapturedInPass + 1;
   const pageInfo = processed.pageInfo;
   if (pageInfo.startCursor && session.seenPageStartCursors.has(pageInfo.startCursor)) return;
+  const checkpoint = session.http429Checkpoint?.[pageSequence - 1] || null;
+  if (checkpoint && !checkpointPageIdentityMatches(checkpoint, item)) {
+    throw new Error('HTTP_429_CHECKPOINT_MISMATCH: после перезагрузки изменилась '
+      + `курсорная идентичность страницы ${pageSequence}. Объединение разных версий истории запрещено.`);
+  }
+  if (checkpoint && !checkpointPageContentMatches(checkpoint, item)) {
+    if (pageSequence !== 1 || requestBefore) {
+      throw new Error('HTTP_429_CHECKPOINT_MISMATCH: изменилось содержимое ранее '
+        + `принятой исторической страницы ${pageSequence}. Безопасное объединение запрещено.`);
+    }
+    // The tail may contain the assistant answer finalized during the cooldown.
+    // Replace only this tail snapshot, and only with identical cursor boundaries.
+    checkpoint.processed = processed;
+    checkpoint.bodyBytes = bodyBytes;
+    checkpoint.requestId = requestId;
+    checkpoint.status = requestInfo.status;
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_TAIL_REFRESHED', {
+      pass: session.pass, pageSequence, startCursor: pageInfo.startCursor,
+      reason: 'same-cursors-new-tail-content',
+    });
+  }
   if (pageInfo.startCursor) session.seenPageStartCursors.add(pageInfo.startCursor);
   if (requestBefore) session.acceptedRequestBeforeCursors.add(requestBefore);
   session.pagesCapturedInPass = pageSequence;
   for (const message of processed.messages || []) {
     if (typeof message?.id === 'string' && message.id) session.currentPassTranscriptIds.add(message.id);
   }
-  session.captures.push({
-    pass: session.pass, pageSequence, requestId, requestBefore, url: requestInfo.url,
-    method: requestInfo.method, resourceType: requestInfo.resourceType || null,
-    status: requestInfo.status ?? null, mimeType: requestInfo.mimeType ?? null,
-    bodyBytes, encodedDataLength: Number.isFinite(params?.encodedDataLength) ? params.encodedDataLength : null,
-    processed,
-  });
-  appendCaptureEvent(session, 'NETWORK_BODY_CAPTURED', {
-    pass: session.pass, totalPasses: session.totalPasses, pageSequence, requestId,
-    url: requestInfo.url, method: requestInfo.method, resourceType: requestInfo.resourceType || null,
-    status: requestInfo.status ?? null, mimeType: requestInfo.mimeType ?? null,
-    bodyBytes, encodedDataLength: Number.isFinite(params?.encodedDataLength) ? params.encodedDataLength : null,
-  });
+  if (checkpoint) {
+    appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_CHECKPOINT_VERIFIED', {
+      pass: session.pass, pageSequence, startCursor: pageInfo.startCursor,
+      preservedRequestId: checkpoint.requestId,
+    });
+    if (pageSequence === session.http429Checkpoint.length) {
+      appendCaptureEvent(session, 'CHATGPT_THREAD_HTTP_429_CHECKPOINT_RESTORED', {
+        pass: session.pass, preservedPages: pageSequence,
+      });
+      session.http429Checkpoint = null;
+    }
+  } else {
+    session.captures.push({
+      pass: session.pass, pageSequence, requestId, requestBefore, url: requestInfo.url,
+      method: requestInfo.method, resourceType: requestInfo.resourceType || null,
+      status: requestInfo.status ?? null, mimeType: requestInfo.mimeType ?? null,
+      bodyBytes, encodedDataLength: Number.isFinite(params?.encodedDataLength) ? params.encodedDataLength : null,
+      processed,
+    });
+    appendCaptureEvent(session, 'NETWORK_BODY_CAPTURED', {
+      pass: session.pass, totalPasses: session.totalPasses, pageSequence, requestId,
+      url: requestInfo.url, method: requestInfo.method, resourceType: requestInfo.resourceType || null,
+      status: requestInfo.status ?? null, mimeType: requestInfo.mimeType ?? null,
+      bodyBytes, encodedDataLength: Number.isFinite(params?.encodedDataLength) ? params.encodedDataLength : null,
+    });
+  }
   if (requestBefore) appendCaptureEvent(session, 'CHATGPT_THREAD_PAGINATION_REQUEST_RESOLVED', {
     pass: session.pass, pageSequence, requestId, beforeCursor: requestBefore,
   });
@@ -971,6 +1110,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       resourceType: String(params?.type || '') || null,
       status: null,
       mimeType: null,
+      responseHeaders: null,
       attemptEpoch: session.attemptEpoch,
       handled: false,
       bodyProcessed: false,
@@ -1013,6 +1153,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === 'Network.responseReceived') {
     requestInfo.status = params.response?.status ?? null;
     requestInfo.mimeType = params.response?.mimeType ?? null;
+    requestInfo.responseHeaders = params.response?.headers || null;
     appendCaptureEvent(session, 'NETWORK_RESPONSE_RECEIVED', {
       pass: session.pass,
       requestId: params.requestId,
@@ -1163,6 +1304,10 @@ async function startCaptureSession(tabId, message) {
     currentPassTranscriptIds: new Set(),
     attemptEpoch: 0,
     http403RetryCount: 0,
+    http429RetryCount: 0,
+    http429Checkpoint: null,
+    httpRetryStatus: null,
+    httpRetryAt: null,
     matchedRequests: 0,
     captures: [],
     events: [],
@@ -1282,6 +1427,13 @@ async function restartCaptureAfterGeneration(tabId) {
       'После перезагрузки ChatGPT снова начал генерацию ответа. '
       + 'Автоматический повтор ограничен. Дождитесь устойчивого завершения ответа и начните экспорт заново.',
     ), 'generation-unstable');
+    return {ok:false, error:session.error, state:serializeCaptureSession(session)};
+  }
+  if (session.http429Checkpoint?.length) {
+    await failCaptureSession(session, new Error(
+      'После восстановления HTTP 429 ChatGPT продолжил генерацию. '
+      + 'Ранее сохранённые страницы могли измениться; автоматическое объединение запрещено.',
+    ), 'http-429-generation-changed');
     return {ok:false, error:session.error, state:serializeCaptureSession(session)};
   }
   session.generationRestartCount += 1;

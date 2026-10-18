@@ -56,7 +56,7 @@ function harness() {
     responseProcessor: 'chatgpt-thread-json', paginationMode: 'scroll-up-until-start',
     requestMethod: 'GET', requestResourceType: null,
     totalPasses: 1, minDelayMs: 100, maxDelayMs: 1000, timeoutMs: 60_000,
-    phase: 'capturing', pass: 1, attemptEpoch: 1, http403RetryCount: 0,
+    phase: 'capturing', pass: 1, attemptEpoch: 1, http403RetryCount: 0, http429RetryCount: 0,
     captures: [{pass: 1, requestId:'old-page'}, {pass: 0, requestId:'older-past-pass'}],
     currentPassCaptured: false, pagesCapturedInPass: 1,
     pageState: {pageSequence:1,startCursor:'cursor-1',hasPreviousPage:true},
@@ -133,12 +133,13 @@ test('cancelled session cannot reload after HTTP 403',async()=>{
   assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,0);
 });
 
-test('HTTP 429 is shown as an HTTP failure, not parsed as JSON and not retried',async()=>{
+test('HTTP 429 schedules a single cooldown instead of an immediate page reload',async()=>{
   const h=harness();h.request('rate-limited');h.response('rate-limited',429);await h.flush();
-  assert.equal(h.session.phase,'error');
-  assert.match(h.session.error,/HTTP 429/);
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.equal(h.session.http429RetryCount,1);
   assert.equal(h.commands.filter(x=>x.method==='Network.getResponseBody').length,0);
-  assert.ok(![...h.timers.values()].some(x=>x.ms===2500));
+  assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,0);
+  assert.ok([...h.timers.values()].some(x=>x.ms===120000));
 });
 
 test('stale loadingFinished response is ignored after HTTP 403 recovery',async()=>{
