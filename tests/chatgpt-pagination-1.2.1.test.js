@@ -169,7 +169,8 @@ test('generation guard sees active Stop, not terminal Retry, and ignores hidden 
   const src=fs.readFileSync(path.join(root,'src/adapters/chatgpt/generation-guard.js'),'utf8');
   const ctx=vm.createContext({});vm.runInContext(src,ctx);
   const check=ctx.__chatContextExporterGenerationGuard.isGenerating;
-  const node=(label, hidden=false)=>({disabled:false,getAttribute:k=>k==='aria-label'?label:null,closest:()=>hidden?{}:null});
+  const node=(label, hidden=false)=>({disabled:false,getAttribute:k=>k==='aria-label'?label:null,closest:()=>hidden?{}:null,
+    getClientRects:()=>[{width:32,height:32}], ownerDocument:{defaultView:{getComputedStyle:()=>({visibility:'visible'})}}});
   assert.equal(check({querySelectorAll:()=>[node('Остановить')]}),true);
   assert.equal(check({querySelectorAll:()=>[node('Stop generating')]}),true);
   assert.equal(check({querySelectorAll:()=>[node('Остановить',true)]}),false);
