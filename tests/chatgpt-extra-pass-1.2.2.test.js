@@ -137,9 +137,9 @@ test('skip after Stop is forbidden when no main pass was completed',async()=>{
 
 test('correct version in manifest and runtime; explicit export-warning mechanism',()=>{
   const namespace=fs.readFileSync(path.join(root,'src/core/namespace.js'),'utf8');
-  assert.equal(manifest.version,'1.3');
-  assert.equal(manifest.version_name,'1.3');
-  assert.match(namespace,/version: '1\.3'/);
+  assert.equal(manifest.version,'1.3.1');
+  assert.equal(manifest.version_name,'1.3.1');
+  assert.match(namespace,/version: '1\.3\.1'/);
   assert.match(content,/CAPTURE_SKIP_EXTRA_PASS_MESSAGE/);
   assert.match(content,/EXPORT_WITH_WARNING/);
   assert.match(content,/Предупреждение экспорта/);

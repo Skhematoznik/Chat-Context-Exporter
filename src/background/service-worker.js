@@ -15,6 +15,9 @@ const CAPTURE_RESPONSE_PROCESSORS = Object.freeze({
   }),
 });
 
+const EARLY_PANEL_SCRIPT = 'src/content/early-panel.js';
+const EARLY_PANEL_RETRY_DELAYS_MS = [0, 350, 1400];
+
 const CONTENT_SCRIPTS = [
   'src/core/namespace.js',
   'src/core/settings.js',
@@ -78,6 +81,7 @@ const MAX_PRE_RELOAD_TAIL_USER_CHARS = 256 * 1024;
 const MAX_PRE_RELOAD_TAIL_ASSISTANT_CHARS = 2 * 1024 * 1024;
 const saveRequests = new Map();
 const captureSessions = new Map();
+const loadingTabs = new Set();
 function nowMs() {
   return Date.now();
 }
@@ -262,7 +266,7 @@ function getCurrentPaginationRequest(session) {
   return matched;
 }
 
-function serializeCaptureSession(session, { includeCaptures = false } = {}) {
+function serializeCaptureSession(session, { includeCaptures = false, includeEvents = true } = {}) {
   if (!session) {
     return null;
   }
@@ -270,6 +274,7 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
   return {
     id: session.id,
     adapterId: session.adapterId,
+    expectedConversationId: session.expectedConversationId || null,
     tabId: session.tabId,
     phase: session.phase,
     startedAt: session.startedAt,
@@ -310,11 +315,39 @@ function serializeCaptureSession(session, { includeCaptures = false } = {}) {
     preReloadTailSnapshot: includeCaptures && session.preReloadTailSnapshot
       ? structuredClone(session.preReloadTailSnapshot)
       : undefined,
-    events: session.events.map((entry) => ({ ...entry })),
+    events: includeEvents ? session.events.map((entry) => ({ ...entry })) : undefined,
     captures: includeCaptures
       ? session.captures.map((capture) => ({ ...capture }))
       : undefined,
   };
+}
+
+// The full runtime still starts only when the document has finished loading.
+// This lightweight, isolated UI is injected on navigation/loading so that the
+// operator can see the active session while ChatGPT itself is still loading.
+async function injectEarlyPanel(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'ISOLATED',
+    files: [EARLY_PANEL_SCRIPT],
+    injectImmediately: true,
+  });
+}
+
+function scheduleEarlyPanelForLoading(tabId) {
+  const session = captureSessions.get(tabId);
+  if (!session || ['released', 'cancelled', 'error', 'ready'].includes(session.phase)) return;
+  for (const delayMs of EARLY_PANEL_RETRY_DELAYS_MS) {
+    setTimeout(() => {
+      const current = captureSessions.get(tabId);
+      if (!current || current.id !== session.id
+          || ['released', 'cancelled', 'error', 'ready'].includes(current.phase)) return;
+      void injectEarlyPanel(tabId).catch(() => {
+        // Chrome can reject injections while a navigation is committing.
+        // A later attempt or the complete-stage runtime remains the fallback.
+      });
+    }, delayMs);
+  }
 }
 
 async function injectRuntime(tabId) {
@@ -441,6 +474,9 @@ async function notifyCaptureSession(session) {
     // После reload content script может еще не быть установлен.
   }
 
+  // Do not start the full runtime inside a document that has not completed
+  // navigation; its DOM and adapter are not yet guaranteed to exist.
+  if (loadingTabs.has(session.tabId)) return;
   try {
     await injectRuntime(session.tabId);
     await chrome.tabs.sendMessage(session.tabId, message).catch(() => {});
@@ -1684,7 +1720,10 @@ async function handleCaptureMessage(message, sender) {
     const session = captureSessions.get(tabId);
     return {
       ok: true,
-      state: serializeCaptureSession(session, { includeCaptures: message.includeCaptures === true }),
+      state: serializeCaptureSession(session, {
+        includeCaptures: message.includeCaptures === true && message.summaryOnly !== true,
+        includeEvents: message.summaryOnly !== true,
+      }),
     };
   }
 
@@ -1798,9 +1837,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading') {
+    loadingTabs.add(tabId);
+    scheduleEarlyPanelForLoading(tabId);
+    return;
+  }
   if (changeInfo.status !== 'complete') {
     return;
   }
+  loadingTabs.delete(tabId);
 
   const session = captureSessions.get(tabId);
   if (session && !['released', 'cancelled'].includes(session.phase)) {
@@ -1838,6 +1883,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  loadingTabs.delete(tabId);
   void removeLocalCacheSyncSession(tabId).catch(() => {});
   void removePreReloadTailSnapshot(tabId).catch(() => {});
 
