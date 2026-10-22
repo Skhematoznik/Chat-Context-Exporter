@@ -80,7 +80,7 @@
     const code = String(block.code ?? '');
     const fenceLength = Math.max(3, longestBacktickRun(code) + 1);
     const fence = '`'.repeat(fenceLength);
-    const language = String(block.language ?? '').replace(/[^a-z0-9_+#.-]/gi, '');
+    const language = String(block.language ?? '').replace(/[^a-z0-9_+#.-]/gi, '') || 'text';
     return `${fence}${language}\n${code}\n${fence}`;
   }
 
@@ -137,6 +137,41 @@
     return output.join('\n');
   }
 
+  // Literal HTML-like placeholders (e.g. <GUID>) should render as text,
+  // not be interpreted as raw HTML by Markdown linters (MD033). Respect
+  // fenced and inline code; keep Markdown autolinks intact.
+  function escapeRawHtmlOutsideCode(value) {
+    let openFence = null;
+    return String(value ?? '').split('\n').map((line) => {
+      const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (fence) {
+        if (!openFence) openFence = fence[1];
+        else if (fence[1][0] === openFence[0]
+            && fence[1].length >= openFence.length && !fence[2].trim()) openFence = null;
+        return line;
+      }
+      if (openFence || /^(?: {4,}|\t)/.test(line)) return line;
+      // Inline code may contain tag examples which must remain byte-identical.
+      let output = '';
+      let pos = 0;
+      while (pos < line.length) {
+        const next = line.indexOf('`', pos);
+        if (next < 0) {
+          output += line.slice(pos).replace(/<(\/?[A-Za-z][\w-]*(?:\s+[^>]*?)?\/?)>/g, '&lt;$1&gt;');
+          break;
+        }
+        output += line.slice(pos, next).replace(/<(\/?[A-Za-z][\w-]*(?:\s+[^>]*?)?\/?)>/g, '&lt;$1&gt;');
+        let end = next;
+        while (line[end] === '`') end += 1;
+        const marker = line.slice(next, end);
+        const close = line.indexOf(marker, end);
+        if (close < 0) { output += marker; pos = end; }
+        else { output += line.slice(next, close + marker.length); pos = close + marker.length; }
+      }
+      return output;
+    }).join('\n');
+  }
+
   // Convert only GFM delimiter rows, preserving all table data and code examples.
   // Some Markdown formatters require spaces around delimiters: | --- | ---: |.
   function normalizeMarkdownTableDelimiters(value) {
@@ -164,6 +199,27 @@
     }).join('\n');
   }
 
+  // The network transcript can already contain Markdown fences. A missing
+  // info string triggers MD040; use `text` rather than guessing a language.
+  // Closing fences and indented code are never modified.
+  function labelUnspecifiedFences(value) {
+    let openFence = null;
+    return String(value ?? '').split('\n').map((line) => {
+      const match = line.match(/^( {0,3})(`{3,}|~{3,})(.*)$/);
+      if (!match) return line;
+      const marker = match[2];
+      const info = match[3].trim();
+      if (openFence) {
+        if (marker[0] === openFence[0] && marker.length >= openFence.length && !info) {
+          openFence = null;
+        }
+        return line;
+      }
+      openFence = marker;
+      return info ? line : `${match[1]}${marker}text`;
+    }).join('\n');
+  }
+
   function renderBlock(block) {
     switch (block.type) {
       case 'paragraph':
@@ -183,7 +239,8 @@
       case 'mathBlock':
         return `$$\n${String(block.value ?? '').trim()}\n$$`;
       case 'markdown':
-        return normalizeMarkdownTableDelimiters(String(block.value ?? '').trim());
+        return escapeRawHtmlOutsideCode(normalizeMarkdownTableDelimiters(
+          labelUnspecifiedFences(String(block.value ?? '').trim())));
       default:
         return '';
     }

@@ -291,6 +291,7 @@ function serializeCaptureSession(session, { includeCaptures = false, includeEven
     pageState: session.pageState ? { ...session.pageState } : null,
     paginationRequest: getCurrentPaginationRequest(session),
     bufferedPaginationPages: session.bufferedPages?.size || 0,
+    attemptEpoch: session.attemptEpoch || 0,
     generationRestartCount: session.generationRestartCount || 0,
     completedPasses: session.completedPasses || 0,
     captureWarning: session.captureWarning || null,
@@ -312,11 +313,13 @@ function serializeCaptureSession(session, { includeCaptures = false, includeEven
     http500CheckpointPages: session.http500Checkpoint?.length || 0,
     preReloadTail: session.preReloadTailSnapshot ? {
       captured: true,
+      authoritative: session.preReloadTailSnapshot.authoritative === true,
       source: session.preReloadTailSnapshot.source,
       reason: session.preReloadTailSnapshot.reason,
       conversationId: session.preReloadTailSnapshot.conversationId,
       userMessageId: session.preReloadTailSnapshot.user?.messageId || null,
       userTurnKey: session.preReloadTailSnapshot.user?.turnKey || null,
+      userHash: session.preReloadTailSnapshot.user?.hash || null,
       assistantChars: session.preReloadTailSnapshot.assistant?.markdown?.length || 0,
       assistantHash: session.preReloadTailSnapshot.assistant?.hash || null,
     } : null,
@@ -535,15 +538,18 @@ async function skipIncompleteExtraPass(session, error, stage) {
   return true;
 }
 
-async function skipExtraPassAfterGeneration(tabId) {
+async function skipExtraPassAfterGeneration(tabId, reason = null) {
   const session = captureSessions.get(tabId);
   if (!session) return {ok:false, error:'Сессия захвата не найдена.'};
   if (session.phase === 'ready' && session.captureWarning) {
     return {ok:true, state:serializeCaptureSession(session)};
   }
+  const deliveryFailed = reason === 'delivery-failed';
   const skipped = await skipIncompleteExtraPass(session,
-    new Error('при перезагрузке страницы повторно обнаружена активная генерация ChatGPT'),
-    'generation-active-extra-pass');
+    new Error(deliveryFailed
+      ? 'ChatGPT сообщил, что ответ не доставлен; дополнительный проход не выполнен'
+      : 'при перезагрузке страницы повторно обнаружена активная генерация ChatGPT'),
+    deliveryFailed ? 'delivery-failed-extra-pass' : 'generation-active-extra-pass');
   return skipped
     ? {ok:true, state:serializeCaptureSession(session)}
     : {ok:false, error:'Нет завершённого основного прохода для безопасного сохранения.'};
@@ -1810,7 +1816,7 @@ async function handleCaptureMessage(message, sender) {
     return updateGenerationGuardWait(tabId, message.waiting === true);
   }
   if (message.type === CAPTURE_SKIP_EXTRA_PASS_MESSAGE) {
-    return skipExtraPassAfterGeneration(tabId);
+    return skipExtraPassAfterGeneration(tabId, message.reason);
   }
   if (message.type === CAPTURE_SCROLL_STEP_MESSAGE) {
     return appendCaptureScrollStep(tabId, message);

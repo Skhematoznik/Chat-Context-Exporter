@@ -46,10 +46,10 @@ function setup() {
   };
   vm.runInContext('captureSessions',context).set(5,session);
   const flush=async()=>{for(let i=0;i<10;i++)await new Promise(r=>setImmediate(r));};
-  async function message(type) {
+  async function message(type, details = {}) {
     let callback;
     const promise=new Promise(r=>{callback=r;});
-    events.message({type}, {tab:{id:5}}, callback);
+    events.message({type,...details}, {tab:{id:5}}, callback);
     await flush();
     return promise;
   }
@@ -137,11 +137,23 @@ test('skip after Stop is forbidden when no main pass was completed',async()=>{
 
 test('correct version in manifest and runtime; explicit export-warning mechanism',()=>{
   const namespace=fs.readFileSync(path.join(root,'src/core/namespace.js'),'utf8');
-  assert.equal(manifest.version,'1.3.4');
-  assert.equal(manifest.version_name,'1.3.4');
-  assert.match(namespace,/version: '1\.3\.4'/);
+  assert.equal(manifest.version,'1.3.7');
+  assert.equal(manifest.version_name,'1.3.7');
+  assert.match(namespace,/version: '1\.3\.7'/);
   assert.match(content,/CAPTURE_SKIP_EXTRA_PASS_MESSAGE/);
   assert.match(content,/EXPORT_WITH_WARNING/);
   assert.match(content,/Предупреждение экспорта/);
   assert.match(content,/waitForChatGptGenerationToSettle\('before-start', currentSettings\)/);
+});
+
+test('visible delivery failure on extra pass saves complete first pass with accurate warning',async()=>{
+  const h=setup();await h.completeMain();
+  h.session.captures.push({pass:2,id:'failed-extra'});
+  const response=await h.message('chat-context-exporter:capture:skip-extra-pass',{reason:'delivery-failed'});
+  assert.equal(response.ok,true);
+  assert.equal(h.session.phase,'ready');
+  assert.equal(h.session.captures.length,1);
+  assert.match(h.session.captureWarning,/ответ не доставлен/);
+  assert.doesNotMatch(h.session.captureWarning,/повторно обнаружена активная генерация/);
+  assert.ok(h.session.events.some(x=>x.event==='CHATGPT_EXTRA_PASS_SKIPPED'&&x.details?.stage==='delivery-failed-extra-pass'));
 });

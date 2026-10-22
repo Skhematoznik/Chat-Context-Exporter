@@ -13,7 +13,8 @@
     'blockquote', 'popover', 'popover-trigger', 'popover-content', 'pressable',
     'form', 'table', 'table-row', 'table-cell', 'table-section',
   ]);
-  const SELF = new Set(['icon', 'divider', 'spacer', 'favicon', 'AsyncImage', 'AsyncVideo', 'Chart']);
+  const SELF = new Set(['icon', 'divider', 'spacer', 'favicon', 'AsyncImage', 'AsyncVideo', 'Chart',
+    'Cite', 'CodeCite', 'FileCite', 'MemoryCite']);
   const CONTROL = new Set(['button', 'checkbox', 'input', 'select', 'slider', 'textarea', 'date-picker', 'radio', 'radio-group']);
   const KNOWN = new Set([...INLINE, ...BLOCK, ...SELF, ...CONTROL, 'CodeBlock', 'WritingBlock']);
 
@@ -162,6 +163,8 @@
         return href ? `[${label.replace(/\]/g, '\\]')}](${href})` : label;
       }
       if (name === 'Entity') return inside || attribute(node.tag, 'value') || '';
+      // Tool citations are UI-only metadata; no offline target exists for them.
+      if (['Cite', 'CodeCite', 'FileCite', 'MemoryCite'].includes(name)) return '';
       if (name === 'icon') {
         const icon = attribute(node.tag, 'name');
         return icon === 'arrow-right' ? ' → ' : icon === 'arrow-down' ? '\n↓\n' : '';
@@ -229,20 +232,24 @@
 
   function normalize(input) {
     const source = String(input ?? '');
-    if (!/<(?:\/?(?:Link|row|box|icon|badge|button|text|title|caption|divider|col|card|grid|flow|Entity)\b)|\{#(?:each|if)\b/.test(source)) {
+    if (!/<(?:\/?(?:Link|row|box|icon|badge|button|text|title|caption|divider|col|card|grid|flow|Entity|WritingBlock|Cite|CodeCite|FileCite|MemoryCite)\b)|\{#(?:each|if)\b/.test(source)) {
       return { markdown: source, components: 0, failed: false };
     }
     const protectedSegments = [];
     let work = protectCode(source.replace(/<CodeBlock\b([^>]*)>([\s\S]*?)<\/CodeBlock>/g,
       (full, attrs, body) => {
         const lang = /language\s*=\s*["']([^"']+)["']/.exec(attrs)?.[1] || '';
-        return fenced(body, lang.replace(/[^\w+#.-]/g, ''));
+        return fenced(body, lang.replace(/[^\w+#.-]/g, '') || 'text');
       }), protectedSegments);
     const protectDirective = (value) => {
       const id = protectedSegments.length;
       protectedSegments.push(value);
       return `\uE0A0${id}\uE0A1`;
     };
+    // WritingBlock owns raw Markdown content. Strip its UI wrapper, but do not
+    // interpret embedded examples, tags or code inside the author's draft.
+    work = work.replace(/<WritingBlock\b[^>]*>([\s\S]*?)<\/WritingBlock>/g,
+      (_whole, body) => protectDirective(body));
     work = staticLoopAsTable(work, protectDirective);
     work = work.replace(/\{#if\b[\s\S]*?\{\/if\}/g, (value) => protectDirective(fenced(value)));
     const stats = { components: 0 };
@@ -253,7 +260,11 @@
     // completed table. Keep their unexecuted source in a fenced block.
     result = result.replace(/\{#(?:if|each)\b[\s\S]*?\{\/(?:if|each)\}/g, (raw) => fenced(raw));
     result = result.replace(/\n{3,}/g, '\n\n').trim();
-    result = result.replace(/\uE0A0(\d+)\uE0A1/g, (match, id) => protectedSegments[Number(id)] ?? match);
+    // A raw WritingBlock may contain a protected Markdown code fence.
+    // Restore nested placeholders without interpreting their contents.
+    for (let depth = 0; depth <= protectedSegments.length && /\uE0A0\d+\uE0A1/.test(result); depth++) {
+      result = result.replace(/\uE0A0(\d+)\uE0A1/g, (match, id) => protectedSegments[Number(id)] ?? match);
+    }
     return { markdown: result, components: stats.components, failed: false };
   }
 

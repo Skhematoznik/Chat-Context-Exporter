@@ -37,16 +37,16 @@ test('settings page exposes editable seconds for 30..3600 and reset to 300',()=>
   assert.match(read('src/options/options.js'),/generationWaitSeconds: 300/);
   assert.match(read('src/options/options.js'),/\['generationWaitSeconds', elements\.generationWaitSeconds/);
   assert.match(read('src/options/options.js'),/chrome\.storage\.local\.set\(\{ \.\.\.DEFAULT_SETTINGS \}\)/);
-  assert.equal(manifest.version,'1.3.4');
-  assert.equal(manifest.version_name,'1.3.4');
-  assert.match(read('src/core/namespace.js'),/version: '1\.3\.4'/);
+  assert.equal(manifest.version,'1.3.7');
+  assert.equal(manifest.version_name,'1.3.7');
+  assert.match(read('src/core/namespace.js'),/version: '1\.3\.7'/);
 });
 
 test('Stop wait is bound to configured seconds on first, after-reload and before-scroll checks',()=>{
   assert.match(content,/settings\.clampGenerationWaitSeconds\(currentSettings\?\.generationWaitSeconds\)/);
   assert.match(content,/waitForChatGptGenerationToSettle\('before-start', currentSettings\)/);
-  assert.match(content,/guardedGenerationWait\('after-reload', currentSettings\)/);
-  assert.match(content,/guardedGenerationWait\('before-scroll', currentSettings\)/);
+  assert.match(content,/guardedGenerationWait\('after-reload', currentSettings,/);
+  assert.match(content,/guardedGenerationWait\('before-scroll', currentSettings,/);
   assert.match(content,/state = await ensureGenerationSettledBeforeScroll\(state, currentSettings\)/);
   assert.match(content,/currentState = await ensureGenerationSettledBeforeScroll\(currentState, currentSettings\)/);
   assert.match(content,/CAPTURE_GENERATION_WAIT_MESSAGE, waiting:true/);

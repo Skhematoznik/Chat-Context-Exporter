@@ -1228,7 +1228,7 @@
     return guard.isGenerating(document);
   }
 
-  async function waitForChatGptGenerationToSettle(phase, currentSettings) {
+  async function waitForChatGptGenerationToSettle(phase, currentSettings, optionalPass = false) {
     const waitSeconds = settings.clampGenerationWaitSeconds(currentSettings?.generationWaitSeconds);
     const waitMs = waitSeconds * 1000;
     const deadline = Date.now() + waitMs;
@@ -1238,6 +1238,13 @@
     log.write('CHATGPT_GENERATION_GUARD_STARTED', {phase, waitSeconds});
     for (;;) {
       if (runtime.aborted) return null;
+      // A delivery-failure banner is not a running answer. Only an optional
+      // pass may fall back to an already verified complete mandatory pass.
+      if (optionalPass && globalThis.__chatContextExporterGenerationGuard
+          ?.hasDeliveryFailure?.(document)) {
+        log.write('CHATGPT_EXTRA_PASS_DELIVERY_FAILURE', {phase});
+        return {observedActive, deliveryFailed:true};
+      }
       const generating = isChatGptGenerating();
       if (generating) {
         if (!observedActive) log.write('CHATGPT_GENERATION_ACTIVE', {phase});
@@ -1325,13 +1332,39 @@
     return currentState;
   }
 
+  // Only for conversation-limit chats: the pre-reload DOM tail is already the
+  // authoritative final answer in the Markdown output. A transient Stop need
+  // not force another reload if the same tail survives and remains visible.
+  function hasUnchangedLimitTail(state, stage) {
+    const guard = globalThis.__chatContextExporterGenerationGuard;
+    if (!state?.pageState?.pageSequence || !guard?.isAuthoritativeLimitTailUnchanged
+        || typeof runtime.adapter?.capturePreReloadTailSnapshot !== 'function') return false;
+    let current = null;
+    try {
+      current = runtime.adapter.capturePreReloadTailSnapshot();
+    } catch (_) {
+      // An incomplete or changing DOM tail must never be treated as verified.
+    }
+    const unchanged = guard.isAuthoritativeLimitTailUnchanged(state.preReloadTail, current);
+    log.write('CHATGPT_GENERATION_LIMIT_TAIL_RECHECK', {
+      pass:state.pass, stage, unchanged, originalAvailable:Boolean(state.preReloadTail?.captured),
+      currentAvailable:Boolean(current),
+    });
+    return unchanged;
+  }
+
   // A second guard at the actual scroll boundary catches Stop that appeared after
   // the initial reload check (e.g. ChatGPT resumes generation asynchronously).
   async function ensureGenerationSettledBeforeScroll(state, currentSettings) {
     if (runtime.scrollGuardValidatedPass === state.pass && !isChatGptGenerating()) return state;
-    const wait = await guardedGenerationWait('before-scroll', currentSettings);
+    const wait = await guardedGenerationWait('before-scroll', currentSettings,
+      state.pass > 1 && (state.completedPasses || 0) >= 1);
     if (!wait || runtime.aborted) return null;
-    if (!wait.observedActive) {
+    if (wait.deliveryFailed) {
+      log.write('CHATGPT_EXTRA_PASS_DELIVERY_FAILURE_DETECTED', {pass:state.pass, stage:'before-scroll'});
+      return (await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE, reason:'delivery-failed'})).state;
+    }
+    if (!wait.observedActive || hasUnchangedLimitTail(state, 'before-scroll')) {
       runtime.scrollGuardValidatedPass = state.pass;
       return state;
     }
@@ -1348,13 +1381,13 @@
     return restarted.state;
   }
 
-  async function guardedGenerationWait(phase, currentSettings) {
+  async function guardedGenerationWait(phase, currentSettings, optionalPass = false) {
     // The network response watchdog is independent of user-configurable Stop waiting.
     // Pausing it prevents HTTP response-timeout while ChatGPT itself is generating.
     const pause = await sendCaptureMessage({type:CAPTURE_GENERATION_WAIT_MESSAGE, waiting:true});
     if (!pause?.ok) throw new Error(pause?.error || 'Не удалось приостановить сетевое ожидание.');
     try {
-      return await waitForChatGptGenerationToSettle(phase, currentSettings);
+      return await waitForChatGptGenerationToSettle(phase, currentSettings, optionalPass);
     } finally {
       await sendCaptureMessage({type:CAPTURE_GENERATION_WAIT_MESSAGE, waiting:false}).catch(()=>{});
     }
@@ -1368,6 +1401,7 @@
     state = await ensureGenerationSettledBeforeScroll(state, currentSettings);
     if (!state || state.phase !== 'awaiting-scroll') return state;
 
+    const activeAttemptEpoch = state.attemptEpoch;
     const previousPageSequence = Number(state.pageState?.pageSequence) || 0;
     const armResponse = await sendCaptureMessage({
       type: CAPTURE_CONTINUE_MESSAGE,
@@ -1413,7 +1447,8 @@
       });
       currentState = stateResponse.state;
       updateNetworkPanel(currentState);
-      if (!currentState || currentState.phase !== 'capturing') {
+      if (!currentState || currentState.phase !== 'capturing'
+          || currentState.attemptEpoch !== activeAttemptEpoch) {
         return currentState;
       }
 
@@ -1433,7 +1468,9 @@
       // Stop may reappear after the pre-scroll check, while a long list is
       // being paginated. Never issue another scroll movement in that state.
       currentState = await ensureGenerationSettledBeforeScroll(currentState, currentSettings);
-      if (!currentState || currentState.phase !== 'capturing') return currentState;
+      if (!currentState || currentState.phase !== 'capturing'
+          || currentState.attemptEpoch !== activeAttemptEpoch
+          || !currentState.pageState?.startCursor) return currentState;
 
       if (!scrollContainer.isConnected) {
         scrollContainer = await waitForNetworkScroller();
@@ -2252,7 +2289,8 @@
         && ['armed', 'capturing', 'awaiting-scroll', 'ready'].includes(state.phase)) {
       let stable;
       try {
-        stable = await guardedGenerationWait('after-reload', currentSettings);
+        stable = await guardedGenerationWait('after-reload', currentSettings,
+          state.pass > 1 && (state.completedPasses || 0) >= 1);
       } catch (error) {
         // On an optional pass, a full verified earlier pass is a safe fallback.
         // On the mandatory pass a timeout remains a hard error.
@@ -2266,7 +2304,10 @@
         } else throw error;
       }
       if (!stable || runtime.aborted) return false;
-      if (stable.observedActive) {
+      if (stable.deliveryFailed) {
+        log.write('CHATGPT_EXTRA_PASS_DELIVERY_FAILURE_DETECTED', {pass:state.pass, stage:'after-reload'});
+        state = (await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE, reason:'delivery-failed'})).state;
+      } else if (stable.observedActive && !hasUnchangedLimitTail(state, 'after-reload')) {
         if (state.pass > 1 && (state.completedPasses || 0) >= 1 && state.pageState?.pageSequence) {
           // Reloading again can itself resume an unsuccessful ChatGPT answer.
           // Never risk a complete main-pass archive to chase an optional pass.
