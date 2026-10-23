@@ -87,7 +87,7 @@ function harness() {
   return {session,handlers,timers,commands,request,response,flush,advance,context};
 }
 
-test('HTTP 403 restarts the same pass after 2500ms and does not mix partial pages',async()=>{
+test('HTTP 403 restarts the same pass after 5000ms and does not mix partial pages',async()=>{
   const h=harness();
   h.session.pass=2; h.session.totalPasses=2;
   h.session.captures[0].pass=2; h.session.captures[1].pass=1;
@@ -99,8 +99,8 @@ test('HTTP 403 restarts the same pass after 2500ms and does not mix partial page
   assert.equal(h.session.captures.length,2,'captured data remains in memory during delay');
   assert.equal(h.session.error,null);
   assert.equal(h.commands.filter(x=>x.method==='Network.getResponseBody').length,0,'HTML refusal is not parsed');
-  assert.ok(h.session.events.some(x=>x.event==='CHATGPT_THREAD_HTTP_403_RETRY_SCHEDULED'&&x.details.delayMs===2500));
-  await h.advance(2500);
+  assert.ok(h.session.events.some(x=>x.event==='CHATGPT_THREAD_RETRY_SCHEDULED'&&x.details.delayMs===5000));
+  await h.advance(5000);
   assert.equal(h.session.pass,2);
   assert.equal(h.session.phase,'capturing');
   assert.equal(h.session.attemptEpoch,2);
@@ -111,40 +111,43 @@ test('HTTP 403 restarts the same pass after 2500ms and does not mix partial page
   assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,1);
 });
 
-test('second HTTP 403 terminates with explicit diagnostic and no further reload',async()=>{
+test('second HTTP 403 uses 10-second linear backoff in the shared budget',async()=>{
   const h=harness();
-  h.request('blocked-page');h.response('blocked-page',403); await h.flush();
-  await h.advance(2500);
+  h.request('blocked-page');h.response('blocked-page',403);await h.flush();
+  await h.advance(5000);
   h.request('blocked-again','https://chatgpt.com/backend-api/conversations/thread');
   h.response('blocked-again',403);await h.flush();
-  assert.equal(h.session.phase,'error');
-  assert.match(h.session.error,/HTTP 403/);
-  assert.match(h.session.error,/не создан/);
-  assert.match(h.session.error,/Повторная попытка/);
-  assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,1);
-  assert.ok(![...h.timers.values()].some(x=>x.ms===2500));
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.equal(h.session.httpRetryCount,2);
+  assert.ok([...h.timers.values()].some(x=>x.ms===10000));
+  await h.advance(10000);
+  assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,2);
 });
 
 test('cancelled session cannot reload after HTTP 403',async()=>{
   const h=harness(); h.request('blocked-page');h.response('blocked-page',403);await h.flush();
   h.session.phase='cancelled';
   vm.runInContext('clearCaptureTimer(captureSessions.get(19))',h.context);
-  assert.ok(![...h.timers.values()].some(x=>x.ms===2500));
+  assert.ok(![...h.timers.values()].some(x=>x.ms===5000));
   assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,0);
 });
 
-test('HTTP 429 schedules a single cooldown instead of an immediate page reload',async()=>{
+test('HTTP 429 schedules five-second restart of the current pass with five-retry limit',async()=>{
   const h=harness();h.request('rate-limited');h.response('rate-limited',429);await h.flush();
   assert.equal(h.session.phase,'waiting-http-retry');
   assert.equal(h.session.http429RetryCount,1);
   assert.equal(h.commands.filter(x=>x.method==='Network.getResponseBody').length,0);
   assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,0);
-  assert.ok([...h.timers.values()].some(x=>x.ms===120000));
+  assert.ok([...h.timers.values()].some(x=>x.ms===5000));
+  await h.advance(5000);
+  assert.equal(h.session.http429RetryCount,1);
+  assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,1);
+  assert.deepEqual(h.session.captures.map(x=>x.requestId), ['older-past-pass']);
 });
 
 test('stale loadingFinished response is ignored after HTTP 403 recovery',async()=>{
   const h=harness();h.request('blocked-page');h.response('blocked-page',403);await h.flush();
-  await h.advance(2500);
+  await h.advance(5000);
   h.handlers.network({tabId:19},'Network.loadingFinished',{requestId:'blocked-page',encodedDataLength:100});
   await h.flush();
   assert.equal(h.session.phase,'capturing');
@@ -153,7 +156,7 @@ test('stale loadingFinished response is ignored after HTTP 403 recovery',async()
 
 test('successful HTTP 200 after retry completes capture without reusing the incomplete first page',async()=>{
   const h=harness();h.request('blocked-page');h.response('blocked-page',403);await h.flush();
-  await h.advance(2500);
+  await h.advance(5000);
   h.request('fresh-initial','https://chatgpt.com/backend-api/conversations/thread?num_turns=10');
   h.response('fresh-initial',200,'application/json');
   h.handlers.network({tabId:19},'Network.loadingFinished',{
@@ -176,4 +179,21 @@ test('nonmatching HTTP 403 does not reset the active cursor chain',async()=>{
   assert.equal(h.session.http403RetryCount,0);
   assert.ok(h.session.events.some(x=>x.event==='CHATGPT_THREAD_RESPONSE_SKIPPED'
     &&x.details.reason==='http-error-outside-current-cursor-chain'));
+});
+
+test('1.4: custom retry settings (3 repeats, 2-second base) apply to cursor and HTTP faults',async()=>{
+  const h=harness();h.session.retryMaxAttempts=3;h.session.retryBaseSeconds=2;
+  h.request('first');h.response('first',403);await h.flush();
+  await h.advance(2000);
+  const fail=vm.runInContext('failCaptureSession',h.context);
+  await fail(h.session,new Error('Missing previous page'),'response-timeout');
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.equal(h.session.httpRetryCount,2);
+  await h.advance(4000);
+  h.request('third','https://chatgpt.com/backend-api/conversations/thread');h.response('third',500);await h.flush();
+  assert.equal(h.session.httpRetryCount,3);
+  await h.advance(6000);
+  await fail(h.session,new Error('Missing previous page'),'response-timeout');
+  assert.equal(h.session.phase,'error');
+  assert.equal(h.commands.filter(x=>x.method==='Page.reload').length,3);
 });

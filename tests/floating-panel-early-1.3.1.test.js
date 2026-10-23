@@ -100,9 +100,9 @@ test('early indicator is self-contained, uses existing DOM host ID and validates
   assert.match(code,/g\[RUNTIME_KEY\]\?\.running/);
   assert.match(code,/MutationObserver/);
   assert.doesNotMatch(JSON.stringify(manifest),/sidePanel|webNavigation|host_permissions/);
-  assert.equal(manifest.version,'1.3.7');
-  assert.equal(manifest.version_name,'1.3.7');
-  assert.equal(source('src/core/namespace.js').includes("version: '1.3.7'"),true);
+  assert.equal(manifest.version,'1.4');
+  assert.equal(manifest.version_name,'1.4');
+  assert.equal(source('src/core/namespace.js').includes("version: '1.4'"),true);
 });
 
 function panelHarness({conversationId = 'target-c',state = null,hostname = 'chatgpt.com'} = {}) {
@@ -137,7 +137,7 @@ test('early overlay displays 429 cooldown, checkpoint counts, original time; ign
   const h=panelHarness();
   await new Promise(r=>setImmediate(r));
   assert.equal(h.elements.size,1);
-  assert.match(h.nodes.get('.status').textContent,/HTTP 429.*ожидание.*Страницы сохранены/i);
+  assert.match(h.nodes.get('.status').textContent,/Ошибка 429.*повтор.*из 5.*через [0-9]+ с/i);
   assert.equal(h.nodes.get('.pages').textContent,'8');
   assert.equal(h.nodes.get('.messages').textContent,'82');
   assert.equal(h.nodes.get('.pass').textContent,'1 / 2');

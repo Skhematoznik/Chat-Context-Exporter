@@ -13,6 +13,8 @@
     extraPassesEnabled: false,
     extraPassCount: 1,
     generationWaitSeconds: 300,
+    errorRetryCount: 5,
+    errorRetryBaseSeconds: 5,
     minDelayMs: 100,
     maxDelayMs: 1000,
   });
@@ -41,6 +43,16 @@
     return Math.min(3600, Math.max(30, Math.round(parsed)));
   }
 
+  function clampErrorRetryCount(value, fallback = DEFAULT_SETTINGS.errorRetryCount) {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.min(10, Math.max(1, Math.round(number))) : fallback;
+  }
+
+  function clampErrorRetryBaseSeconds(value, fallback = DEFAULT_SETTINGS.errorRetryBaseSeconds) {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.min(60, Math.max(1, Math.round(number))) : fallback;
+  }
+
   async function loadSettings() {
     try {
       const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
@@ -57,6 +69,8 @@
           : DEFAULT_SETTINGS.extraPassesEnabled,
         extraPassCount: clampExtraPassCount(stored.extraPassCount),
         generationWaitSeconds: clampGenerationWaitSeconds(stored.generationWaitSeconds),
+        errorRetryCount: clampErrorRetryCount(stored.errorRetryCount),
+        errorRetryBaseSeconds: clampErrorRetryBaseSeconds(stored.errorRetryBaseSeconds),
         minDelayMs: clampDelay(stored.minDelayMs, DEFAULT_SETTINGS.minDelayMs),
         maxDelayMs: clampDelay(stored.maxDelayMs, DEFAULT_SETTINGS.maxDelayMs),
       };
@@ -70,6 +84,8 @@
     clampDelay,
     clampExtraPassCount,
     clampGenerationWaitSeconds,
+    clampErrorRetryCount,
+    clampErrorRetryBaseSeconds,
     loadSettings,
   };
 })();

@@ -653,6 +653,80 @@
     return stats;
   }
 
+  // Every completed pass contributes its IDs. Order constraints are obtained
+  // from adjacency within verified cursor chains, not timestamps (which can
+  // be absent or repeated). Conflicting content keeps pass 1 and is reported.
+  function mergeVerifiedPassSnapshots(snapshots) {
+    if (snapshots.length < 2) return { snapshot: snapshots[0], added: 0, conflicts: [], orderConflicts: false };
+    const first = snapshots[0];
+    const byId = new Map();
+    const firstSeen = new Map();
+    const adjacency = new Map();
+    const indegree = new Map();
+    const conflicts = [];
+    const conflictedIds = new Set();
+    let added = 0;
+    for (const snapshot of snapshots) {
+      if (!snapshot.cursorChainComplete || !snapshot.startReached || !snapshot.tailReached) {
+        throw new Error(`ChatGPT Thread: проход ${snapshot.pass} не подтверждает полную курсорную цепочку.`);
+      }
+      const ids = [];
+      for (const message of snapshot.messages) {
+        const id = message?.id;
+        if (!id) continue;
+        if (!byId.has(id)) {
+          if (snapshot !== first) added += 1;
+          firstSeen.set(id, firstSeen.size);
+          byId.set(id, message);
+          indegree.set(id, 0);
+          adjacency.set(id, new Set());
+        } else if (messageFingerprint(byId.get(id)) !== messageFingerprint(message)
+                   && !conflictedIds.has(id)) {
+          conflictedIds.add(id);
+          conflicts.push(id);
+        }
+        ids.push(id);
+      }
+      for (let i = 1; i < ids.length; i += 1) {
+        const a = ids[i-1], b = ids[i];
+        if (a === b || adjacency.get(a).has(b)) continue;
+        adjacency.get(a).add(b);
+        indegree.set(b, indegree.get(b) + 1);
+      }
+    }
+    const available = [...indegree.keys()].filter(id => indegree.get(id) === 0);
+    const ordered = [];
+    while (available.length) {
+      available.sort((a,b) => firstSeen.get(a) - firstSeen.get(b));
+      const id = available.shift();
+      ordered.push(id);
+      for (const next of adjacency.get(id)) {
+        indegree.set(next, indegree.get(next)-1);
+        if (indegree.get(next) === 0) available.push(next);
+      }
+    }
+    const orderConflicts = ordered.length !== byId.size;
+    if (orderConflicts) {
+      // A reordered branch cannot be safely inserted into a linear history.
+      // Keep pass 1 and make the discrepancy explicit rather than guessing.
+      return { snapshot: first, added: 0, conflicts, orderConflicts: true };
+    }
+    const messages = ordered.map(id=>byId.get(id));
+    const user = messages.filter(m=>m.role==='user').length;
+    const assistant = messages.filter(m=>m.role==='assistant').length;
+    return {
+      snapshot: {
+        ...first,
+        messages,
+        stats: { ...first.stats, total: messages.length, user, assistant,
+          other: messages.length-user-assistant,
+          timestampedMessages: messages.filter(m=>Boolean(m.timestamp)).length,
+          missingTimestampMessages: messages.filter(m=>!m.timestamp).length },
+      },
+      added, conflicts, orderConflicts: false,
+    };
+  }
+
   function buildDiagnostics(snapshot, passStats, tailDiagnostics = null) {
     const stats = snapshot.stats || {};
     const references = stats.references || {};
@@ -775,7 +849,8 @@
 
     parseNetworkCaptures(captures, options = {}) {
       const passSnapshots = buildAllPassSnapshots(captures);
-      const networkSelected = passSnapshots[passSnapshots.length - 1];
+      const merged = mergeVerifiedPassSnapshots(passSnapshots);
+      const networkSelected = merged.snapshot;
       const conversationIds = new Set(passSnapshots.map((snapshot) => snapshot.conversationId).filter(Boolean));
       if (conversationIds.size > 1) {
         throw new Error(`ChatGPT Thread: проходы относятся к разным разговорам (${[...conversationIds].join(' / ')}).`);
@@ -785,6 +860,13 @@
       const tailResult = applyPreReloadTailOverride(networkSelected, options.preReloadTailSnapshot || null);
       const selected = tailResult.snapshot;
       const stats = selected.stats;
+      const mergeWarnings = [];
+      if (merged.conflicts.length) {
+        mergeWarnings.push(`Сообщения с изменённым содержимым между проходами: ${merged.conflicts.length}; сохранена версия первого прохода.`);
+      }
+      if (merged.orderConflicts) {
+        mergeWarnings.push('Конфликт порядка/ветви между проходами: объединение отменено, сохранён проверенный первый проход.');
+      }
       const startedAt = selected.createTime || selected.messages.find((message) => message.timestamp)?.timestamp || null;
 
       return {
@@ -799,7 +881,11 @@
           assistant: stats.assistant,
           other: 0,
         },
-        diagnostics: buildDiagnostics(selected, passStats, tailResult.diagnostics),
+        diagnostics: {
+          ...buildDiagnostics(selected, passStats, tailResult.diagnostics),
+          merge: {added: merged.added, conflicts: merged.conflicts.length, orderConflicts: merged.orderConflicts},
+          warnings: mergeWarnings,
+        },
       };
     },
   });

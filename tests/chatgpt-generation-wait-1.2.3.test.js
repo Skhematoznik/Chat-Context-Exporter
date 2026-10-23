@@ -37,20 +37,20 @@ test('settings page exposes editable seconds for 30..3600 and reset to 300',()=>
   assert.match(read('src/options/options.js'),/generationWaitSeconds: 300/);
   assert.match(read('src/options/options.js'),/\['generationWaitSeconds', elements\.generationWaitSeconds/);
   assert.match(read('src/options/options.js'),/chrome\.storage\.local\.set\(\{ \.\.\.DEFAULT_SETTINGS \}\)/);
-  assert.equal(manifest.version,'1.3.7');
-  assert.equal(manifest.version_name,'1.3.7');
-  assert.match(read('src/core/namespace.js'),/version: '1\.3\.7'/);
+  assert.equal(manifest.version,'1.4');
+  assert.equal(manifest.version_name,'1.4');
+  assert.match(read('src/core/namespace.js'),/version: '1\.4'/);
 });
 
-test('Stop wait is bound to configured seconds on first, after-reload and before-scroll checks',()=>{
+test('initial Stop alone triggers wait; resumed sessions never check Stop again',()=>{
   assert.match(content,/settings\.clampGenerationWaitSeconds\(currentSettings\?\.generationWaitSeconds\)/);
+  assert.match(content,/config\.responseProcessor === 'chatgpt-thread-json' && isChatGptGenerating\(\)/);
   assert.match(content,/waitForChatGptGenerationToSettle\('before-start', currentSettings\)/);
-  assert.match(content,/guardedGenerationWait\('after-reload', currentSettings,/);
-  assert.match(content,/guardedGenerationWait\('before-scroll', currentSettings,/);
-  assert.match(content,/state = await ensureGenerationSettledBeforeScroll\(state, currentSettings\)/);
-  assert.match(content,/currentState = await ensureGenerationSettledBeforeScroll\(currentState, currentSettings\)/);
-  assert.match(content,/CAPTURE_GENERATION_WAIT_MESSAGE, waiting:true/);
-  assert.match(content,/CAPTURE_GENERATION_WAIT_MESSAGE, waiting:false/);
+  assert.doesNotMatch(content,/waitForChatGptGenerationToSettle\('after-reload'/);
+  assert.doesNotMatch(content,/guardedGenerationWait\(/);
+  assert.doesNotMatch(content,/ensureGenerationSettledBeforeScroll\(/);
+  const scroll=content.slice(content.indexOf('  async function advanceNetworkPagination('),content.indexOf('  async function waitForNetworkCaptureState('));
+  assert.doesNotMatch(scroll,/isChatGptGenerating|generation-guard|Stop|Остановить/);
   assert.doesNotMatch(content,/CHATGPT_GENERATION_MAX_WAIT_MS/);
 });
 
@@ -106,8 +106,8 @@ test('in awaiting-scroll phase guard pause/resume does not arm premature respons
   assert.ok(h.session.events.some(e=>e.event==='CHATGPT_GENERATION_NETWORK_TIMEOUT_RESUMED'));
 });
 
-test('never skip an incomplete mandatory pass; verified extra pass fallback unchanged',async()=>{
-  assert.match(content,/if \(state\.pass > 1 && \(state\.completedPasses \|\| 0\) >= 1\)/);
-  assert.match(content,/CAPTURE_SKIP_EXTRA_PASS_MESSAGE/);
-  assert.match(content,/if \(state\.pass > 1 && \(state\.completedPasses \|\| 0\) >= 1 && state\.pageState\?\.pageSequence\)/);
+test('a failed extra pass still has verified-primary fallback; no implicit primary success',()=>{
+  assert.match(background,/skipIncompleteExtraPass\(session/);
+  assert.match(background,/session\.completedPasses/);
+  assert.match(content,/CHATGPT_THREAD_PAGINATION_SCROLL_MODE/);
 });

@@ -110,16 +110,17 @@ test('future pages are buffered and linked after missing intermediate arrives',a
   assert.equal(h.session.cursorGapTimer,null);
 });
 
-test('unresolved gap fails with exact CURSOR_CHAIN_INCOMPLETE, no partial success',async()=>{
+test('unresolved gap triggers shared recoverable retry, not partial success',async()=>{
   const h=createHarness();
   h.sendPage(0);await h.flush();
   h.sendPage(2);await h.flush();
   await h.expire(15000);
-  assert.equal(h.session.phase,'error');
-  assert.match(h.session.error,/CURSOR_CHAIN_INCOMPLETE/);
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.equal(h.session.httpRetryCount,1);
   assert.ok(h.session.events.some(x=>x.event==='CHATGPT_THREAD_CURSOR_CHAIN_INCOMPLETE'));
   assert.ok(!h.session.events.some(x=>x.event==='CAPTURE_READY'));
-  assert.equal(h.session.captures.length,1);
+  await h.expire(5000);
+  assert.equal(h.session.captures.length,0);
 });
 
 test('a page observed before initial tail is retained and drained',async()=>{
@@ -220,8 +221,8 @@ test('pending expected request remains visible until CDP body capture completes'
 });
 
 
-// Candidate 1.3: HTTP 429 is handled only for the cursor currently required
-// by the pagination chain. Accepted pages are checkpointed and revalidated.
+// Candidate 1.3.9: HTTP 429 on required cursor restarts the current pass
+// without pause, up to five times. No incomplete pages can survive a restart.
 function send429(h, {id='rate-limited',before,headers={}}={}) {
   const url='https://chatgpt.com/backend-api/conversations/thread/messages'
     +(before ? `?before=${encodeURIComponent(before)}` : '');
@@ -233,62 +234,47 @@ function send429(h, {id='rate-limited',before,headers={}}={}) {
   });
 }
 
-test('429 on expected cursor preserves accepted pages, waits, verifies them and continues',async()=>{
+test('429 on required cursor reloads after linear backoff the pass, discarding incomplete pages',async()=>{
   const h=createHarness();
   for(let i=0;i<3;i++){h.sendPage(i);await h.flush();}
-  assert.equal(h.session.captures.length,3);
-  const previous=h.session.captures.slice();
   send429(h,{before:pages[2].startCursor});await h.flush();
   assert.equal(h.session.phase,'waiting-http-retry');
-  assert.equal(h.session.captures.length,3);
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,0);
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_HTTP_429_RETRY_SCHEDULED'
-    && e.details.preservedPages===3 && e.details.delayMs===120000));
-  await h.expire(120000);
+  assert.equal(h.session.http429RetryCount,1);
+  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_RETRY_SCHEDULED'
+    &&e.details.delayMs===5000&&e.details.maxRetries===5));
+  await h.expire(5000);
   assert.equal(h.session.phase,'capturing');
   assert.equal(h.session.pageState,null);
-  assert.equal(h.session.http429Checkpoint.length,3);
-  assert.equal(h.session.captures.length,3);
+  assert.equal(h.session.captures.length,0);
   assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
-  for(let i=0;i<3;i++){h.sendPage(i,`replayed-${i}`);await h.flush();}
-  assert.equal(h.session.captures.length,3);
-  assert.equal(h.session.http429Checkpoint,null);
-  assert.equal(h.session.pagesCapturedInPass,3);
-  for(let i=0;i<3;i++)assert.equal(h.session.captures[i],previous[i]);
-  h.sendPage(3,'continued-page');await h.flush();
+  for(let i=0;i<4;i++){h.sendPage(i,`retry-${i}`);await h.flush();}
   assert.equal(h.session.captures.length,4);
-  assert.equal(h.session.captures[3].pageSequence,4);
-  assert.equal(h.session.pageState.startCursor,pages[3].startCursor);
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_HTTP_429_CHECKPOINT_RESTORED'
-    && e.details.preservedPages===3));
+  assert.equal(h.session.pagesCapturedInPass,4);
+  assert.deepEqual(h.session.captures.map(c=>c.pageSequence),[1,2,3,4]);
 });
 
-test('429 Retry-After is respected; overlong server restriction cannot trigger reload',async()=>{
+test('HTTP 429 uses configured backoff independent of response headers',async()=>{
   const h=createHarness();h.sendPage(0);await h.flush();
-  send429(h,{before:pages[0].startCursor,headers:{'retry-after':'240'}});await h.flush();
+  send429(h,{before:pages[0].startCursor,headers:{'Retry-After':'1200'}});await h.flush();
   assert.equal(h.session.phase,'waiting-http-retry');
-  assert.ok([...h.timers.values()].some(t=>t.ms===240000));
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,0);
-  const g=createHarness();g.sendPage(0);await g.flush();
-  send429(g,{before:pages[0].startCursor,headers:{'Retry-After':'1200'}});await g.flush();
-  assert.equal(g.session.phase,'error');
-  assert.match(g.session.error,/HTTP 429.*1200/);
-  assert.ok(!g.commands.some(c=>c.method==='Page.reload'));
+  assert.ok([...h.timers.values()].some(t=>t.ms===5000));
+  await h.expire(5000);
+  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
 });
 
-test('second HTTP 429 after cooldown is terminal and cannot save a partial first pass',async()=>{
-  const h=createHarness();h.sendPage(0);await h.flush();
-  send429(h,{before:pages[0].startCursor});await h.flush();await h.expire(120000);
-  h.sendPage(0,'replayed');await h.flush();
-  send429(h,{id:'again',before:pages[0].startCursor});await h.flush();
+test('at most five HTTP 429 restarts; sixth error fails incomplete mandatory pass',async()=>{
+  const h=createHarness();
+  for(let i=1;i<=6;i++){
+    send429(h,{id:`429-${i}`,before:null});await h.flush();
+    if(i<=5){assert.equal(h.session.httpRetryCount,i);await h.expire(i*5000);}
+  }
   assert.equal(h.session.phase,'error');
   assert.match(h.session.error,/HTTP 429/);
+  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,5);
   assert.ok(!h.session.events.some(e=>e.event==='CAPTURE_READY'));
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
-  assert.equal(h.session.captures.length,1);
 });
 
-test('429 on unsolicited initial requests is ignored and never initiates reload',async()=>{
+test('429 on unsolicited initial requests is ignored after the initial page is accepted',async()=>{
   const h=createHarness();h.sendPage(0);await h.flush();
   send429(h,{before:null});await h.flush();
   assert.equal(h.session.phase,'awaiting-scroll');
@@ -296,37 +282,22 @@ test('429 on unsolicited initial requests is ignored and never initiates reload'
   assert.ok(!h.commands.some(c=>c.method==='Page.reload'));
 });
 
-test('changed historical content after reload is rejected, even with equal cursors',async()=>{
-  const h=createHarness();h.sendPage(0);await h.flush();h.sendPage(1);await h.flush();
-  send429(h,{before:pages[1].startCursor});await h.flush();await h.expire(120000);
-  h.sendPage(0,'replayed-tail');await h.flush();
-  h.session.http429Checkpoint[1].processed.messages[0].id='tampered-historical-message';
-  h.sendPage(1,'changed-history');await h.flush();
-  assert.equal(h.session.phase,'error');
-  assert.match(h.session.error,/HTTP_429_CHECKPOINT_MISMATCH/);
-  assert.ok(!h.session.events.some(e=>e.event==='CAPTURE_READY'));
-});
-
-test('tail finalized during cooldown is refreshed only when all cursor boundaries match',async()=>{
+test('new 429 restart always uses freshly loaded historical messages',async()=>{
   const h=createHarness();h.sendPage(0);await h.flush();h.sendPage(1);await h.flush();
   const oldTail=h.session.captures[0];
-  send429(h,{before:pages[1].startCursor});await h.flush();await h.expire(120000);
-  oldTail.processed.messages[0].id='stale-partial-assistant';
-  h.sendPage(0,'fresh-final-tail');await h.flush();
-  assert.equal(h.session.phase,'awaiting-scroll');
-  assert.equal(h.session.captures[0],oldTail);
-  assert.equal(h.session.captures[0].processed.messages[0].id,`message-${pages[0].startCursor}`);
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_HTTP_429_TAIL_REFRESHED'));
-  h.sendPage(1,'unchanged-history');await h.flush();
+  send429(h,{before:pages[1].startCursor});await h.flush();await h.expire(5000);
+  assert.equal(h.session.captures.length,0);
+  h.sendPage(0,'fresh-tail');await h.flush();
+  h.sendPage(1,'fresh-history');await h.flush();
   assert.equal(h.session.captures.length,2);
+  assert.notEqual(h.session.captures[0],oldTail);
   assert.equal(h.session.http429Checkpoint,null);
 });
 
-test('cancel during rate-limit cooldown prevents a delayed reload',async()=>{
+test('cancel before immediate retry prevents reload',async()=>{
   const h=createHarness();h.sendPage(0);await h.flush();
   send429(h,{before:pages[0].startCursor});await h.flush();
-  let respond;
-  const done=new Promise(resolve=>respond=resolve);
+  let respond; const done=new Promise(resolve=>respond=resolve);
   h.handlers.message({type:'chat-context-exporter:capture:cancel'},{tab:{id:19}},respond);
   await h.flush();await done;
   assert.equal(h.session.phase,'cancelled');
@@ -334,166 +305,105 @@ test('cancel during rate-limit cooldown prevents a delayed reload',async()=>{
   assert.ok(!h.commands.some(c=>c.method==='Page.reload'));
 });
 
-test('after HTTP 429 cooldown, a revalidated checkpoint can reach start without duplicate captures',async()=>{
+test('after immediate restart a complete cursor chain reaches the beginning',async()=>{
   const fixture=pages.map((p,i)=>({...p,hasPreviousPage:i!==pages.length-1}));
   const h=createHarness({pageInfoList:fixture});
   for(let i=0;i<4;i++){h.sendPage(i);await h.flush();}
-  send429(h,{before:fixture[3].startCursor});await h.flush();
-  await h.expire(120000);
+  send429(h,{before:fixture[3].startCursor});await h.flush();await h.expire(5000);
   for(let i=0;i<fixture.length;i++){h.sendPage(i,`retry-${i}`);await h.flush();}
   assert.equal(h.session.phase,'ready');
   assert.equal(h.session.captures.length,fixture.length);
-  assert.equal(h.session.pagesCapturedInPass,fixture.length);
-  assert.equal(h.session.http429Checkpoint,null);
   assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_START_REACHED'));
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
 });
 
-test('second-pass repeated 429 falls back to the already completed first pass',async()=>{
+test('exhausted retries in optional pass retain complete primary capture',async()=>{
   const h=createHarness();
   h.session.pass=2;h.session.totalPasses=2;h.session.completedPasses=1;
   h.session.captures.push({pass:1,requestId:'complete-pass'});
-  h.sendPage(0);await h.flush();
-  send429(h,{before:pages[0].startCursor});await h.flush();await h.expire(120000);
-  h.sendPage(0,'replayed');await h.flush();
-  send429(h,{id:'retry-failed',before:pages[0].startCursor});await h.flush();
+  for(let i=1;i<=6;i++){
+    send429(h,{id:`extra429-${i}`,before:null});await h.flush();
+    if(i<=5) await h.expire(i*5000);
+  }
   assert.equal(h.session.phase,'ready');
   assert.match(h.session.captureWarning,/Дополнительная проверка/);
   assert.equal(h.session.captures.length,1);
   assert.equal(h.session.captures[0].requestId,'complete-pass');
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_EXTRA_PASS_SKIPPED'));
 });
 
-// Candidate 1.3.4: HTTP 500 retry with the same in-memory cursor checkpoint
-// guarantees as 429, but a separate bounded retry budget and delay.
-function send500(h, { id = 'internal-error', before, headers = {} } = {}) {
-  const url = 'https://chatgpt.com/backend-api/conversations/thread/messages'
-    + (before ? `?before=${encodeURIComponent(before)}` : '');
-  h.handlers.event({tabId:19}, 'Network.requestWillBeSent', {
-    requestId: id, type: 'Fetch', request: {url, method: 'GET'},
+// 1.4: HTTP 500 uses the same retry budget as 403 and 429, restarts the pass.
+function send500(h, {id='internal-error',before,headers={}}={}) {
+  const url='https://chatgpt.com/backend-api/conversations/thread/messages'
+    +(before ? `?before=${encodeURIComponent(before)}` : '');
+  h.handlers.event({tabId:19},'Network.requestWillBeSent',{
+    requestId:id,type:'Fetch',request:{url,method:'GET'},
   });
-  h.handlers.event({tabId:19}, 'Network.responseReceived', {
-    requestId: id, response: {status:500, mimeType:'application/json', headers},
+  h.handlers.event({tabId:19},'Network.responseReceived',{
+    requestId:id,response:{status:500,mimeType:'application/json',headers},
   });
 }
 
-test('HTTP 500 preserves accepted pages, delays 30 seconds, revalidates and continues with no duplicates', async () => {
-  const h = createHarness();
-  for (let i=0;i<3;i++){h.sendPage(i);await h.flush();}
-  const accepted = h.session.captures.slice();
-  send500(h,{before:pages[2].startCursor});await h.flush();
-  assert.equal(h.session.phase,'waiting-http-retry');
-  assert.equal(h.session.httpRetryStatus,500);
-  assert.equal(h.session.http500RetryCount,1);
-  assert.equal(h.session.captures.length,3);
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,0);
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_HTTP_500_RETRY_SCHEDULED'
-    &&e.details.delayMs===30000 &&e.details.preservedPages===3));
-  await h.expire(30000);
-  assert.equal(h.session.phase,'capturing');
-  assert.equal(h.session.http500Checkpoint.length,3);
-  assert.equal(h.session.pageState,null);
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
-  for(let i=0;i<3;i++){h.sendPage(i,`500-replayed-${i}`);await h.flush();}
-  assert.equal(h.session.http500Checkpoint,null);
-  assert.equal(h.session.captures.length,3);
-  for(let i=0;i<3;i++) assert.equal(h.session.captures[i],accepted[i]);
-  h.sendPage(3,'continued-after-500');await h.flush();
-  assert.equal(h.session.captures.length,4);
-  assert.equal(h.session.pagesCapturedInPass,4);
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_HTTP_500_CHECKPOINT_RESTORED'
-    &&e.details.preservedPages===3));
-});
-
-test('HTTP 500 respects bounded Retry-After and avoids overly late reload',async()=>{
-  const h=createHarness();h.sendPage(0);await h.flush();
-  send500(h,{before:pages[0].startCursor,headers:{'Retry-After':'75'}});await h.flush();
-  assert.equal(h.session.phase,'waiting-http-retry');
-  assert.ok([...h.timers.values()].some(t=>t.ms===75000));
-  const g=createHarness();g.sendPage(0);await g.flush();
-  send500(g,{before:pages[0].startCursor,headers:{'Retry-After':'360'}});await g.flush();
-  assert.equal(g.session.phase,'error');
-  assert.match(g.session.error,/HTTP 500.*360/);
-  assert.ok(!g.commands.some(c=>c.method==='Page.reload'));
-});
-
-test('second HTTP 500 on required cursor fails mandatory pass without another reload',async()=>{
-  const h=createHarness();h.sendPage(0);await h.flush();
-  send500(h,{before:pages[0].startCursor});await h.flush();await h.expire(30000);
-  h.sendPage(0,'retry-page');await h.flush();
-  send500(h,{id:'500-again',before:pages[0].startCursor});await h.flush();
-  assert.equal(h.session.phase,'error');
-  assert.match(h.session.error,/HTTP 500/);
-  assert.match(h.session.error,/Экспорт не создан/);
-  assert.ok(!h.session.events.some(e=>e.event==='CAPTURE_READY'));
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
-});
-
-test('HTTP 500 in optional pass retries once, then retains full first pass without contradictory warning',async()=>{
+test('HTTP 500 waits five seconds, discards incomplete current pass, retains verified earlier pass',async()=>{
   const h=createHarness();h.session.pass=2;h.session.totalPasses=2;h.session.completedPasses=1;
-  h.session.captures.push({pass:1,requestId:'completed-main'});
+  h.session.captures.push({pass:1,requestId:'verified-main'});
   h.sendPage(0);await h.flush();
-  send500(h,{before:pages[0].startCursor});await h.flush();await h.expire(30000);
-  h.sendPage(0,'500-extra-replay');await h.flush();
-  send500(h,{id:'500-extra-failed',before:pages[0].startCursor});await h.flush();
-  assert.equal(h.session.phase,'ready');
-  assert.equal(h.session.captures.length,1);
-  assert.equal(h.session.captures[0].requestId,'completed-main');
-  assert.match(h.session.captureWarning,/Сохранён только полный проход 1 из 2/);
-  assert.doesNotMatch(h.session.captureWarning,/Экспорт не создан|история неполная/);
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_EXTRA_PASS_SKIPPED'));
-  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,1);
+  send500(h,{before:pages[0].startCursor});await h.flush();
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.equal(h.session.httpRetryCount,1);
+  assert.ok([...h.timers.values()].some(t=>t.ms===5000));
+  await h.expire(5000);
+  assert.equal(h.session.phase,'capturing');
+  assert.equal(h.session.http500Checkpoint,null);
+  assert.deepEqual(h.session.captures.map(c=>c.requestId),['verified-main']);
 });
 
-test('HTTP 500 checkpoint rejects modified historic page even when cursors remain the same',async()=>{
-  const h=createHarness();h.sendPage(0);await h.flush();h.sendPage(1);await h.flush();
-  send500(h,{before:pages[1].startCursor});await h.flush();await h.expire(30000);
-  h.sendPage(0,'tail-replayed-500');await h.flush();
-  h.session.http500Checkpoint[1].processed.messages[0].id='changed-history-500';
-  h.sendPage(1,'history-replayed-500');await h.flush();
+test('HTTP 500 obeys common linear backoff even if server supplies Retry-After',async()=>{
+  const h=createHarness();
+  send500(h,{headers:{'Retry-After':'360'}});await h.flush();
+  assert.equal(h.session.phase,'waiting-http-retry');
+  assert.ok([...h.timers.values()].some(t=>t.ms===5000));
+  await h.expire(5000);
+  send500(h,{id:'500-next',headers:{'Retry-After':'400'}});await h.flush();
+  assert.equal(h.session.httpRetryCount,2);
+  assert.ok([...h.timers.values()].some(t=>t.ms===10000));
+});
+
+test('mixed HTTP 403, 429, 500 consume one shared five-retry budget',async()=>{
+  const h=createHarness();
+  const codes=[403,429,500,403,429,500];
+  for(let i=0;i<codes.length;i++){
+    const id=`mixed-${i}`;
+    const url='https://chatgpt.com/backend-api/conversations/thread/messages';
+    h.handlers.event({tabId:19},'Network.requestWillBeSent',{
+      requestId:id,type:'Fetch',request:{url,method:'GET'},
+    });
+    h.handlers.event({tabId:19},'Network.responseReceived',{
+      requestId:id,response:{status:codes[i],mimeType:'application/json'},
+    });
+    await h.flush();
+    if(i<5) {
+      assert.equal(h.session.httpRetryCount,i+1);
+      await h.expire((i+1)*5000);
+    }
+  }
   assert.equal(h.session.phase,'error');
-  assert.match(h.session.error,/HTTP_500_CHECKPOINT_MISMATCH/);
+  assert.equal(h.commands.filter(c=>c.method==='Page.reload').length,5);
+  assert.match(h.session.error,/HTTP 500/);
 });
 
-test('unrelated HTTP 500 does not disturb pagination or schedule a recovery',async()=>{
+test('HTTP 500 on unsolicited initial page does not reset accepted historical cursor',async()=>{
   const h=createHarness();h.sendPage(0);await h.flush();
   send500(h,{before:null});await h.flush();
   assert.equal(h.session.phase,'awaiting-scroll');
-  assert.equal(h.session.http500RetryCount || 0,0);
-  assert.ok(!h.commands.some(c=>c.method==='Page.reload'));
+  assert.equal(h.session.httpRetryCount||0,0);
 });
 
-test('cancel during HTTP 500 pause disarms the delayed reload',async()=>{
-  const h=createHarness();h.sendPage(0);await h.flush();
-  send500(h,{before:pages[0].startCursor});await h.flush();
-  let respond;const done=new Promise(r=>respond=r);
-  h.handlers.message({type:'chat-context-exporter:capture:cancel'},{tab:{id:19}},respond);
-  await h.flush();await done;
-  assert.equal(h.session.phase,'cancelled');
-  assert.equal(h.timers.size,0);
-  assert.ok(!h.commands.some(c=>c.method==='Page.reload'));
-});
-
-test('HTTP 500 recovery can replay a full checkpoint and reach the beginning',async()=>{
-  const list=pages.map((p,i)=>({...p,hasPreviousPage:i!==pages.length-1}));
+test('HTTP 500 successful reload can complete a valid full chain',async()=>{
+  const list=pages.map((x,i)=>({...x,hasPreviousPage:i!==pages.length-1}));
   const h=createHarness({pageInfoList:list});
   for(let i=0;i<3;i++){h.sendPage(i);await h.flush();}
-  send500(h,{before:list[2].startCursor});await h.flush();await h.expire(30000);
-  for(let i=0;i<list.length;i++){h.sendPage(i,`replay-all-500-${i}`);await h.flush();}
+  send500(h,{before:list[2].startCursor});await h.flush();await h.expire(5000);
+  for(let i=0;i<list.length;i++){h.sendPage(i,`fresh-${i}`);await h.flush();}
   assert.equal(h.session.phase,'ready');
   assert.equal(h.session.captures.length,list.length);
-  assert.equal(h.session.http500Checkpoint,null);
-  assert.ok(h.session.events.some(e=>e.event==='CHATGPT_THREAD_START_REACHED'));
-});
-
-test('HTTP 500 on initial page retries safely with zero preserved pages',async()=>{
-  const h=createHarness();
-  send500(h,{before:null});await h.flush();
-  assert.equal(h.session.phase,'waiting-http-retry');
-  await h.expire(30000);
-  assert.equal(h.session.phase,'capturing');
-  assert.equal(h.session.http500Checkpoint,null);
-  h.sendPage(0,'initial-500-retry-success');await h.flush();
-  assert.equal(h.session.captures.length,1);
-  assert.equal(h.session.pagesCapturedInPass,1);
+  assert.ok(h.session.events.some(x=>x.event==='CHATGPT_THREAD_START_REACHED'));
 });

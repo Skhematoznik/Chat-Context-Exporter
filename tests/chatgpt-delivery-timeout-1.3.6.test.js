@@ -23,6 +23,7 @@ function alert(message, {hidden = false, historical = false, visible = true} = {
   };
 }
 function doc(...alerts) {return {querySelectorAll(selector) {
+  if (selector.includes('[data-turn-key]')) return [];
   assert.match(selector, /\[role="alert"\]/); return alerts;
 }};}
 test('observed delivery-timeout alert structure from real DOM snapshot', () => {
@@ -42,11 +43,11 @@ test('false positives blocked for historical, hidden, end-of-chat and rate-limit
   assert.equal(check(doc(alert('Вы достигли конца истории.'))), false);
   assert.equal(check(doc(alert('Вы достигли лимита использования.'))), false);
 });
-test('delivery-failure skip remains restricted to optional pass with completed mandatory pass', () => {
+test('delivery failure no longer aborts or pauses the primary history collection', () => {
   const start = fs.readFileSync(path.join(root, 'src/content/start.js'), 'utf8');
   const worker = fs.readFileSync(path.join(root, 'src/background/service-worker.js'), 'utf8');
-  assert.match(start, /if \(optionalPass && globalThis\.__chatContextExporterGenerationGuard/);
-  assert.match(start, /reason:'delivery-failed'/);
+  assert.match(start, /globalThis\.__chatContextExporterGenerationGuard\?\.hasDeliveryFailure/);
+  assert.match(start, /await notePrimaryDeliveryFailure\(state, 'after-reload'\)/);
+  assert.doesNotMatch(start, /guardedGenerationWait\(/);
   assert.match(worker, /skipIncompleteExtraPass\(session/);
-  assert.match(worker, /Нет завершённого основного прохода для безопасного сохранения/);
 });

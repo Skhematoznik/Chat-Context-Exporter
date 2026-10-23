@@ -28,10 +28,10 @@ test('no failure from absent, hidden or historical text',()=>{
  assert.equal(hasFailure(doc(notice('Ответ не доставлен',{insideMessage:true}))),false);
  assert.equal(hasFailure(doc(notice('Ограничение использования достигнуто'))),false);
 });
-test('only verified extra pass can skip when a visible delivery-failure alert is present',()=>{
+test('delivery banner is a non-blocking warning while pagination must complete',()=>{
  const s=fs.readFileSync(path.join(root,'src/content/start.js'),'utf8');
- assert.match(s,/optionalPass && globalThis\.__chatContextExporterGenerationGuard/);
- assert.match(s,/CHATGPT_EXTRA_PASS_DELIVERY_FAILURE_DETECTED/);
- assert.match(s,/state\.pass > 1 && \(state\.completedPasses \|\| 0\) >= 1/);
- assert.match(s,/CAPTURE_SKIP_EXTRA_PASS_MESSAGE/);
+ assert.match(s,/globalThis\.__chatContextExporterGenerationGuard\?\.hasDeliveryFailure/);
+ assert.match(s,/await notePrimaryDeliveryFailure\(state, 'after-reload'\)/);
+ assert.doesNotMatch(s,/guardedGenerationWait\('after-reload'/);
+ assert.match(s,/state = await waitForNetworkCaptureState\(state, currentSettings, config\)/);
 });

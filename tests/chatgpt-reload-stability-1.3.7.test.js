@@ -36,38 +36,37 @@ test('changed answer, user, conversation or missing limit alert always requires 
   assert.equal(same({...original,authoritative:false},fresh),false);
   assert.equal(same({...original,userMessageId:null},fresh),false);
 });
-test('after-reload and before-scroll use same fail-closed tail comparison',()=>{
+test('pre-reload tail preserved; no subsequent Stop check can block scrolling',()=>{
   const content=fs.readFileSync(path.join(root,'src/content/start.js'),'utf8');
-  assert.match(content,/hasUnchangedLimitTail\(state, 'after-reload'\)/);
-  assert.match(content,/hasUnchangedLimitTail\(state, 'before-scroll'\)/);
-  assert.match(content,/state\?\.pageState\?\.pageSequence/);
-  assert.match(content,/current = runtime\.adapter\.capturePreReloadTailSnapshot\(\)/);
+  assert.doesNotMatch(content,/hasUnchangedLimitTail\(/);
+  assert.doesNotMatch(content,/ensureGenerationSettledBeforeScroll\(/);
+  assert.match(content,/if \(config\.responseProcessor === 'chatgpt-thread-json' && isChatGptGenerating\(\)\)/);
   const bg=fs.readFileSync(path.join(root,'src/background/service-worker.js'),'utf8');
   assert.match(bg,/attemptEpoch: session\.attemptEpoch \|\| 0/);
   assert.match(bg,/userHash: session\.preReloadTailSnapshot\.user\?\.hash/);
 });
 
-test('stale scroll coordinator does not scroll after generation restart advanced reload epoch',async()=>{
+test('old scroll coordinator refuses movement after a 429 reload changed attemptEpoch',async()=>{
   const content=fs.readFileSync(path.join(root,'src/content/start.js'),'utf8');
   const start=content.indexOf('  async function advanceNetworkPagination(state, currentSettings) {');
-  const end=content.indexOf('  async function waitForNetworkCaptureState(',start);
+  const end=content.indexOf('  async function signalRecoverablePaginationFailure(',start);
   assert.ok(start>0&&end>start);
   const code=content.slice(start,end);
-  let checks=0,scrollMoves=0;
+  let scrollMoves=0;
   const container={isConnected:true,clientHeight:647};
   const initial={phase:'awaiting-scroll',pass:1,attemptEpoch:4,pageState:{pageSequence:1,startCursor:'p1'}};
   const armed={...initial,phase:'capturing'};
   const restarted={phase:'capturing',pass:1,attemptEpoch:5,pageState:null};
+  let calls=0;
   const context={
     runtime:{aborted:false,abortController:{signal:{}},operationStep:0},
-    ensureGenerationSettledBeforeScroll:async(state)=>{checks++;return checks===1?state:restarted;},
-    sendCaptureMessage:async(req)=>({state:req.type==='continue'?armed:armed}),
+    sendCaptureMessage:async(req)=>({state:req.type==='continue'?armed:(++calls&&restarted)}),
     CAPTURE_CONTINUE_MESSAGE:'continue',CAPTURE_GET_STATE_MESSAGE:'get-state',
     waitForNetworkScroller:async()=>container,
     HTMLElement:class {},
     log:{write(){}},
     scroller:{FAST_SCROLL_STEP_VIEWPORTS:5,FAST_MIN_SCROLL_STEP_PX:1200,getFastStepPx:()=>3235,
-      scrollUpFastStep(){scrollMoves++;return {};}},
+      scrollUpFastStep(){scrollMoves++;return {}; }},
     MAX_ITERATIONS:5,CHATGPT_NETWORK_FAST_SCROLL_SETTLE_MS:120,
     randomInteger:()=>1,sleep:async()=>true,
     updateNetworkPanel(){},hasPendingPaginationRequest:()=>false,
@@ -77,7 +76,6 @@ test('stale scroll coordinator does not scroll after generation restart advanced
   const result=await fn(initial,{minDelayMs:1,maxDelayMs:1});
   assert.equal(result.attemptEpoch,5);
   assert.equal(scrollMoves,0);
-  assert.equal(checks,2);
 });
 
 test('old extra-pass generation restart path cannot throw on an undefined message object',()=>{

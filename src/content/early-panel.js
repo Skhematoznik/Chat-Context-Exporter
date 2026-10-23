@@ -38,15 +38,8 @@
   function statusFor(state) {
     if (!state) return 'Загружаю страницу и восстанавливаю статус экспорта...';
     if (state.phase === 'waiting-http-retry') {
-      if (state.httpRetryStatus === 429) {
-        const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
-        return `HTTP 429: ожидание ${remaining} с. Собранные страницы сохранены.`;
-      }
-      if (state.httpRetryStatus === 500) {
-        const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
-        return `HTTP 500: повтор через ${remaining} с. Собранные страницы сохранены.`;
-      }
-      return 'HTTP 403: ожидаю повторной загрузки страницы...';
+      const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
+      return `Ошибка ${state.httpRetryStatus || 'загрузки'}: повтор ${state.httpRetryCount || 0} из ${state.retryMaxAttempts || 5} через ${remaining} с.`;
     }
     if (state.phase === 'waiting-next-pass') return 'Подготовка дополнительного прохода...';
     if (state.phase === 'ready') return 'Сбор завершён. Проверяю данные...';

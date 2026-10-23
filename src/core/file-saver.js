@@ -42,13 +42,14 @@
     content,
     mimeType,
     saveAs = false,
+    waitForCompletion = false,
     requestId = null,
     onAttempt = null,
   }) {
     const stableRequestId = requestId || createRequestId();
     const manual = Boolean(saveAs);
     const maxAttempts = manual ? 1 : AUTO_SAVE_MAX_ATTEMPTS;
-    const timeoutMs = manual ? MANUAL_SAVE_TIMEOUT_MS : AUTO_SAVE_TIMEOUT_MS;
+    const timeoutMs = waitForCompletion ? 60_000 : (manual ? MANUAL_SAVE_TIMEOUT_MS : AUTO_SAVE_TIMEOUT_MS);
     let lastError = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -68,6 +69,7 @@
             content,
             mimeType,
             saveAs: manual,
+            waitForCompletion,
           }),
           timeoutMs,
           `Истекло время ожидания сохранения файла (${Math.ceil(timeoutMs / 1000)} с).`,

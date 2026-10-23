@@ -28,10 +28,22 @@
 
   function hasDeliveryFailure(doc) {
     if (!doc || typeof doc.querySelectorAll !== 'function') return false;
-    // Only current visible error/alert UI, never historical chat messages or
-    // arbitrary text quoted by the user in the transcript.
+    // Most alerts are outside message rows. On some ChatGPT builds the actual
+    // delivery-failure alert is inside the final conversation turn; accept
+    // that case only when the alert has a Retry control and belongs to the
+    // latest turn. Never treat a quoted alert from older history as terminal.
+    const turns = Array.from(doc.querySelectorAll('[data-turn-key], [data-content-search-turn-key]'));
+    const latestTurn = turns[turns.length - 1] || null;
     for (const element of doc.querySelectorAll('[role="alert"], [data-sonner-toast], [data-testid*="error"], [data-testid*="toast"]')) {
-      if (element.closest?.('article, [data-message-id], [data-testid^="conversation-turn"]')) continue;
+      const inMessage = element.closest?.('article, [data-message-id], [data-testid^="conversation-turn"]');
+      if (inMessage) {
+        const hasRetryControl = Array.from(element.querySelectorAll?.('button') || [])
+          .some((button) => {
+            const label = `${button.textContent || ''} ${button.getAttribute?.('aria-label') || ''}`;
+            return /(?:повторить|retry|try again)/i.test(label);
+          });
+        if (!hasRetryControl || !latestTurn?.contains?.(element)) continue;
+      }
       if (!DELIVERY_FAILURE_RE.test(element.textContent || '')) continue;
       if (element.closest?.('[hidden], [aria-hidden="true"], [inert]')) continue;
       if (typeof element.getClientRects !== 'function'

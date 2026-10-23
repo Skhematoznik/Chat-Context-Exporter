@@ -7,6 +7,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   extraPassesEnabled: false,
   extraPassCount: 1,
   generationWaitSeconds: 300,
+  errorRetryCount: 5,
+  errorRetryBaseSeconds: 5,
   minDelayMs: 100,
   maxDelayMs: 1000,
 });
@@ -21,6 +23,8 @@ const elements = {
   extraPassCount: document.querySelector('#extraPassCount'),
   extraPassCountRow: document.querySelector('#extraPassCountRow'),
   generationWaitSeconds: document.querySelector('#generationWaitSeconds'),
+  errorRetryCount: document.querySelector('#errorRetryCount'),
+  errorRetryBaseSeconds: document.querySelector('#errorRetryBaseSeconds'),
   minDelayMs: document.querySelector('#minDelayMs'),
   maxDelayMs: document.querySelector('#maxDelayMs'),
   reset: document.querySelector('#reset'),
@@ -79,6 +83,8 @@ function normalizeStoredSettings(stored) {
       : DEFAULT_SETTINGS.extraPassesEnabled,
     extraPassCount: readExtraPassCount(stored.extraPassCount),
     generationWaitSeconds: clampNumber(stored.generationWaitSeconds, 30, 3600, DEFAULT_SETTINGS.generationWaitSeconds),
+    errorRetryCount: clampNumber(stored.errorRetryCount, 1, 10, DEFAULT_SETTINGS.errorRetryCount),
+    errorRetryBaseSeconds: clampNumber(stored.errorRetryBaseSeconds, 1, 60, DEFAULT_SETTINGS.errorRetryBaseSeconds),
     minDelayMs: readDelayValue(stored.minDelayMs, DEFAULT_SETTINGS.minDelayMs),
     maxDelayMs: readDelayValue(stored.maxDelayMs, DEFAULT_SETTINGS.maxDelayMs),
   };
@@ -96,6 +102,8 @@ function render(settings) {
   elements.extraPassesEnabled.checked = settings.extraPassesEnabled;
   elements.extraPassCount.value = String(settings.extraPassCount);
   elements.generationWaitSeconds.value = String(settings.generationWaitSeconds);
+  elements.errorRetryCount.value = String(settings.errorRetryCount);
+  elements.errorRetryBaseSeconds.value = String(settings.errorRetryBaseSeconds);
   elements.minDelayMs.value = String(settings.minDelayMs);
   elements.maxDelayMs.value = String(settings.maxDelayMs);
   updateExtraPassControls(settings.extraPassesEnabled);
@@ -201,6 +209,8 @@ function attachHandlers() {
       max: 3600,
       fallback: DEFAULT_SETTINGS.generationWaitSeconds,
     }],
+    ['errorRetryCount', elements.errorRetryCount, { min: 1, max: 10, fallback: DEFAULT_SETTINGS.errorRetryCount }],
+    ['errorRetryBaseSeconds', elements.errorRetryBaseSeconds, { min: 1, max: 60, fallback: DEFAULT_SETTINGS.errorRetryBaseSeconds }],
     ['extraPassCount', elements.extraPassCount, {
       min: 1,
       max: 3,

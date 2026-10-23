@@ -102,18 +102,13 @@ test('HTTP 429 / network failure of optional pass degrades to ready-with-warning
   assert.equal(h.calls.detach,1);
 });
 
-test('mandatory incomplete first pass still fails without partial export',async()=>{
+test('mandatory incomplete first pass retries before it can fail without partial export',async()=>{
   const h=setup();
   await vm.runInContext('failCaptureSession',h.context)(h.session,new Error('CURSOR_CHAIN_INCOMPLETE'),'cursor-chain-incomplete');
-  assert.equal(h.session.phase,'error');
+  assert.equal(h.session.phase,'waiting-http-retry');
   assert.equal(h.session.completedPasses,0);
-  assert.equal(h.session.captureWarning,undefined);
   assert.ok(!h.session.events.some(x=>x.event==='CAPTURE_READY_WITH_WARNING'));
-  assert.equal(h.calls.detach,1);
-  const final=await h.message('chat-context-exporter:capture:cancel');
-  assert.equal(final.ok,true);
-  assert.equal(h.calls.detach,1,'already failed session must not detach twice');
-  assert.ok(!h.session.events.some(x=>x.event==='CANCEL_REQUESTED'));
+  assert.equal(h.calls.detach,0);
 });
 
 test('real successfully completed optional pass remains a true two-pass completion',async()=>{
@@ -137,9 +132,9 @@ test('skip after Stop is forbidden when no main pass was completed',async()=>{
 
 test('correct version in manifest and runtime; explicit export-warning mechanism',()=>{
   const namespace=fs.readFileSync(path.join(root,'src/core/namespace.js'),'utf8');
-  assert.equal(manifest.version,'1.3.7');
-  assert.equal(manifest.version_name,'1.3.7');
-  assert.match(namespace,/version: '1\.3\.7'/);
+  assert.equal(manifest.version,'1.4');
+  assert.equal(manifest.version_name,'1.4');
+  assert.match(namespace,/version: '1\.4'/);
   assert.match(content,/CAPTURE_SKIP_EXTRA_PASS_MESSAGE/);
   assert.match(content,/EXPORT_WITH_WARNING/);
   assert.match(content,/Предупреждение экспорта/);

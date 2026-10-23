@@ -65,6 +65,7 @@
     stop: null,
     networkMode: false,
     scrollGuardValidatedPass: null,
+    primaryDeliveryFailureObserved: false,
   };
 
   globalThis[APP_KEY] = runtime;
@@ -87,6 +88,7 @@
   const CAPTURE_GENERATION_RESTART_MESSAGE = 'chat-context-exporter:capture:generation-restart';
   const CAPTURE_SKIP_EXTRA_PASS_MESSAGE = 'chat-context-exporter:capture:skip-extra-pass';
   const CAPTURE_GENERATION_WAIT_MESSAGE = 'chat-context-exporter:capture:generation-wait';
+  const CAPTURE_DELIVERY_FAILURE_MESSAGE = 'chat-context-exporter:capture:delivery-failure';
   const CAPTURE_STATUS_MESSAGE = 'chat-context-exporter:capture:status';
   const LOCAL_CACHE_SYNC_START_MESSAGE = 'chat-context-exporter:local-cache-sync:start';
   const LOCAL_CACHE_SYNC_GET_STATE_MESSAGE = 'chat-context-exporter:local-cache-sync:get-state';
@@ -379,7 +381,7 @@
     return response;
   }
 
-  async function saveMarkdownArtifact(artifact, reason, { saveAs = false } = {}) {
+  async function saveMarkdownArtifact(artifact, reason, { saveAs = false, waitForCompletion = false } = {}) {
     log.write('MARKDOWN_SAVE_REQUESTED', {
       reason,
       filename: artifact.filename,
@@ -390,6 +392,7 @@
     const response = await fileSaver.saveTextFile({
       ...artifact,
       saveAs,
+      waitForCompletion,
       onAttempt(details) {
         log.write('MARKDOWN_SAVE_ATTEMPT', {
           reason,
@@ -1193,17 +1196,11 @@
       case 'awaiting-scroll':
         runtime.panel.setStatus('Прокручиваю к предыдущей странице...');
         break;
-      case 'waiting-http-retry':
-        if (state.httpRetryStatus === 429) {
-          const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
-          runtime.panel.setStatus(`HTTP 429: лимит запросов сервера. Ожидание ${remaining} с; затем один повтор. Страницы сохранены.`);
-        } else if (state.httpRetryStatus === 500) {
-          const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
-          runtime.panel.setStatus(`HTTP 500: временная ошибка сервера. Повтор через ${remaining} с. Принятые страницы сохранены.`);
-        } else {
-          runtime.panel.setStatus('ChatGPT вернул HTTP 403. Через 2,5 с перезагружу страницу и повторю сбор...');
-        }
+      case 'waiting-http-retry': {
+        const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
+        runtime.panel.setStatus(`Ошибка ${state.httpRetryStatus || 'загрузки'}: повтор ${state.httpRetryCount || 0} из ${state.retryMaxAttempts || 5} через ${remaining} с.`);
         break;
+      }
       case 'waiting-next-pass':
         runtime.panel.setStatus('Готовлю дополнительный проход...');
         break;
@@ -1238,11 +1235,13 @@
     log.write('CHATGPT_GENERATION_GUARD_STARTED', {phase, waitSeconds});
     for (;;) {
       if (runtime.aborted) return null;
-      // A delivery-failure banner is not a running answer. Only an optional
-      // pass may fall back to an already verified complete mandatory pass.
-      if (optionalPass && globalThis.__chatContextExporterGenerationGuard
-          ?.hasDeliveryFailure?.(document)) {
-        log.write('CHATGPT_EXTRA_PASS_DELIVERY_FAILURE', {phase});
+      // A visible delivery-timeout/retry alert is a terminal UI state, not
+      // generation in progress. Recognize it on the mandatory pass too; the
+      // full cursor chain is still required before any Markdown can be saved.
+      // The optional pass continues to use the verified-primary fallback.
+      if (globalThis.__chatContextExporterGenerationGuard?.hasDeliveryFailure?.(document)) {
+        log.write(optionalPass ? 'CHATGPT_EXTRA_PASS_DELIVERY_FAILURE'
+          : 'CHATGPT_PRIMARY_PASS_DELIVERY_FAILURE', {phase});
         return {observedActive, deliveryFailed:true};
       }
       const generating = isChatGptGenerating();
@@ -1332,74 +1331,17 @@
     return currentState;
   }
 
-  // Only for conversation-limit chats: the pre-reload DOM tail is already the
-  // authoritative final answer in the Markdown output. A transient Stop need
-  // not force another reload if the same tail survives and remains visible.
-  function hasUnchangedLimitTail(state, stage) {
-    const guard = globalThis.__chatContextExporterGenerationGuard;
-    if (!state?.pageState?.pageSequence || !guard?.isAuthoritativeLimitTailUnchanged
-        || typeof runtime.adapter?.capturePreReloadTailSnapshot !== 'function') return false;
-    let current = null;
-    try {
-      current = runtime.adapter.capturePreReloadTailSnapshot();
-    } catch (_) {
-      // An incomplete or changing DOM tail must never be treated as verified.
-    }
-    const unchanged = guard.isAuthoritativeLimitTailUnchanged(state.preReloadTail, current);
-    log.write('CHATGPT_GENERATION_LIMIT_TAIL_RECHECK', {
-      pass:state.pass, stage, unchanged, originalAvailable:Boolean(state.preReloadTail?.captured),
-      currentAvailable:Boolean(current),
-    });
-    return unchanged;
-  }
-
-  // A second guard at the actual scroll boundary catches Stop that appeared after
-  // the initial reload check (e.g. ChatGPT resumes generation asynchronously).
-  async function ensureGenerationSettledBeforeScroll(state, currentSettings) {
-    if (runtime.scrollGuardValidatedPass === state.pass && !isChatGptGenerating()) return state;
-    const wait = await guardedGenerationWait('before-scroll', currentSettings,
-      state.pass > 1 && (state.completedPasses || 0) >= 1);
-    if (!wait || runtime.aborted) return null;
-    if (wait.deliveryFailed) {
-      log.write('CHATGPT_EXTRA_PASS_DELIVERY_FAILURE_DETECTED', {pass:state.pass, stage:'before-scroll'});
-      return (await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE, reason:'delivery-failed'})).state;
-    }
-    if (!wait.observedActive || hasUnchangedLimitTail(state, 'before-scroll')) {
-      runtime.scrollGuardValidatedPass = state.pass;
-      return state;
-    }
-    // An already-accepted initial JSON may predate the assistant's final answer.
-    // Do not scroll it as if it were an authoritative snapshot.
-    if (state.pass > 1 && (state.completedPasses || 0) >= 1) {
-      log.write('CHATGPT_EXTRA_PASS_GENERATION_DETECTED', {pass:state.pass, stage:'before-scroll'});
-      return (await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE})).state;
-    }
-    log.write('CHATGPT_GENERATION_RECAPTURE_REQUIRED', {pass:state.pass, stage:'before-scroll'});
-    const restarted = await sendCaptureMessage({type:CAPTURE_GENERATION_RESTART_MESSAGE});
-    if (!restarted.ok) throw new Error(restarted.error || 'Не удалось повторить сбор после генерации.');
-    runtime.scrollGuardValidatedPass = null;
-    return restarted.state;
-  }
-
-  async function guardedGenerationWait(phase, currentSettings, optionalPass = false) {
-    // The network response watchdog is independent of user-configurable Stop waiting.
-    // Pausing it prevents HTTP response-timeout while ChatGPT itself is generating.
-    const pause = await sendCaptureMessage({type:CAPTURE_GENERATION_WAIT_MESSAGE, waiting:true});
-    if (!pause?.ok) throw new Error(pause?.error || 'Не удалось приостановить сетевое ожидание.');
-    try {
-      return await waitForChatGptGenerationToSettle(phase, currentSettings, optionalPass);
-    } finally {
-      await sendCaptureMessage({type:CAPTURE_GENERATION_WAIT_MESSAGE, waiting:false}).catch(()=>{});
-    }
+  async function notePrimaryDeliveryFailure(state, stage) {
+    runtime.primaryDeliveryFailureObserved = true;
+    log.write('CHATGPT_PRIMARY_PASS_DELIVERY_FAILURE_TERMINAL', {pass:state.pass, stage});
+    const recorded = await sendCaptureMessage({type:CAPTURE_DELIVERY_FAILURE_MESSAGE});
+    if (!recorded?.ok) throw new Error(recorded?.error || 'Ошибка фиксации предупреждения о доставке.');
   }
 
   async function advanceNetworkPagination(state, currentSettings) {
     if (!state || state.phase !== 'awaiting-scroll') {
       return state;
     }
-
-    state = await ensureGenerationSettledBeforeScroll(state, currentSettings);
-    if (!state || state.phase !== 'awaiting-scroll') return state;
 
     const activeAttemptEpoch = state.attemptEpoch;
     const previousPageSequence = Number(state.pageState?.pageSequence) || 0;
@@ -1464,13 +1406,6 @@
         // The matching request disappeared without advancing the page (for example,
         // capture recovery). Resume scrolling only in that exceptional case.
       }
-
-      // Stop may reappear after the pre-scroll check, while a long list is
-      // being paginated. Never issue another scroll movement in that state.
-      currentState = await ensureGenerationSettledBeforeScroll(currentState, currentSettings);
-      if (!currentState || currentState.phase !== 'capturing'
-          || currentState.attemptEpoch !== activeAttemptEpoch
-          || !currentState.pageState?.startCursor) return currentState;
 
       if (!scrollContainer.isConnected) {
         scrollContainer = await waitForNetworkScroller();
@@ -1541,6 +1476,18 @@
     throw new Error(`ChatGPT Thread: превышен лимит ${MAX_ITERATIONS} scroll-шагов для одной страницы пагинации.`);
   }
 
+  async function signalRecoverablePaginationFailure(state, reason) {
+    if (!state || runtime.aborted || runtime.adapter?.id !== 'chatgpt') return state;
+    log.write('CHATGPT_THREAD_PAGINATION_RECOVERY_REQUESTED', {
+      pass: state.pass, attemptEpoch: state.attemptEpoch, reason,
+    });
+    const answer = await sendCaptureMessage({
+      type: 'chat-context-exporter:capture:pagination-failure',
+      pass: state.pass, attemptEpoch: state.attemptEpoch, reason,
+    });
+    return answer.state;
+  }
+
   async function waitForNetworkCaptureState(initialState, currentSettings, config) {
     let state = initialState;
 
@@ -1555,7 +1502,16 @@
       }
 
       if (state.phase === 'awaiting-scroll' && config?.paginationMode === 'scroll-up-until-start') {
-        state = await advanceNetworkPagination(state, currentSettings);
+        try {
+          const previous = state;
+          state = await advanceNetworkPagination(state, currentSettings);
+          if (!state && !runtime.aborted) {
+            state = await signalRecoverablePaginationFailure(previous, 'scroll-container-unavailable');
+          }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          state = await signalRecoverablePaginationFailure(state, reason);
+        }
         continue;
       }
 
@@ -2177,6 +2133,48 @@
     return snapshot;
   }
 
+  async function saveEmergencyLimitTailOnFailure(state) {
+    if (!state || state.phase !== 'error' || Number(state.completedPasses || 0) > 0
+        || runtime.adapter?.id !== 'chatgpt') return false;
+    let snapshot = state.preReloadTailSnapshot || null;
+    if (!snapshot) {
+      try {
+        const answer = await sendCaptureMessage({ type: CAPTURE_GET_STATE_MESSAGE, includeCaptures: true });
+        snapshot = answer?.state?.preReloadTailSnapshot || null;
+      } catch (error) {
+        log.write('EMERGENCY_TAIL_READ_FAILED', { message: String(error?.message || error) });
+      }
+    }
+    if (snapshot?.authoritative !== true || snapshot?.reason !== 'conversation-limit'
+        || !snapshot?.user?.markdown?.trim() || !snapshot?.assistant?.markdown?.trim()) return false;
+    const title = (document.title || 'Диалог ChatGPT').replace(/\s*[—|-]\s*ChatGPT\s*$/i,'').trim();
+    const header = '> **Аварийная копия: полный экспорт не завершён.**\n'
+      + '> Последний ответ сохранён из HTML до перезагрузки. История разговора неполная.\n'
+      + `> Причина: ${String(state.error || 'ошибка получения истории').replace(/[\r\n<>]/g,' ')}\n\n`;
+    const artifact = {
+      filename: markdownExporter.createFilename(`${title} - последний ответ - аварийная копия`, 'Последний ответ ChatGPT'),
+      content: header + `# ${title}\n\n## Последнее сообщение пользователя\n\n`
+        + snapshot.user.markdown + '\n\n## Последний ответ ассистента\n\n'
+        + snapshot.assistant.markdown + '\n',
+      mimeType: 'text/markdown',
+    };
+    runtime.panel.setStatus('Полный экспорт не завершён. Сохраняю аварийную копию последнего ответа...');
+    try {
+      const result = await saveMarkdownArtifact(artifact, 'emergency-tail', { saveAs: false, waitForCompletion: true });
+      log.write('EMERGENCY_TAIL_SAVED', { filename: artifact.filename, downloadId: result.downloadId });
+      runtime.panel.setStatus('Экспорт не завершён; последний ответ ассистента сохранён отдельным файлом.');
+      runtime.panel.setCloseTitle('Закрыть');
+      runtime.panel.markError();
+      return true;
+    } catch (error) {
+      log.write('EMERGENCY_TAIL_SAVE_FAILED', { message: String(error?.message || error) });
+      runtime.panel.setStatus('Экспорт не завершён. Аварийную копию сохранить не удалось: '
+        + String(error?.message || error));
+      runtime.panel.markError();
+      return false;
+    }
+  }
+
   async function runNetworkAdapter(currentSettings, detection) {
     runtime.networkMode = true;
     runtime.adapter = detection.adapter;
@@ -2208,10 +2206,13 @@
       runtime.panel.setPass(1, totalPasses);
       runtime.panel.setStatus('Подключаюсь...');
 
-      if (config.responseProcessor === 'chatgpt-thread-json') {
+      // Only Stop visible at the moment the user starts export can delay capture.
+      // Any generation started by a later Page.reload must never block pagination.
+      if (config.responseProcessor === 'chatgpt-thread-json' && isChatGptGenerating()) {
+        log.write('CHATGPT_INITIAL_STOP_ACTIVE');
         const stable = await waitForChatGptGenerationToSettle('before-start', currentSettings);
         if (!stable || runtime.aborted) return false;
-        runtime.panel.setStatus('Ответ ChatGPT стабилизировался. Подключаю сетевой захват...');
+        runtime.panel.setStatus('Первоначальный ответ завершён. Подключаю сетевой захват...');
       }
 
       let preReloadTailSnapshot = null;
@@ -2220,7 +2221,7 @@
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         log.write('CHATGPT_LIMIT_TAIL_CAPTURE_FAILED', { message });
-        runtime.panel.setStatus(`Ошибка: ${message}`);
+        runtime.panel.setStatus(`Экспорт не начат: ${message} Сохраните последнее сообщение пользователя и ответ ассистента вручную; страница не перезагружалась.`);
         runtime.panel.markError();
         await log.saveOnce('ERROR');
         return false;
@@ -2258,7 +2259,12 @@
 
       if (state?.phase === 'error') {
         log.importEntries?.(state.events || []);
+        const emergencySaved = await saveEmergencyLimitTailOnFailure(state);
         await sendCaptureMessage({ type: CAPTURE_RELEASE_MESSAGE }).catch(() => {});
+        if (emergencySaved) {
+          await log.saveOnce('ERROR');
+          return false;
+        }
         throw new Error(state.error || 'Не удалось запустить сетевой захват.');
       }
 
@@ -2285,50 +2291,13 @@
     runtime.panel.setMessageCount(0);
     updateNetworkPanel(state);
 
+    // After Page.reload ignore Stop unconditionally. ChatGPT may regenerate the
+    // last answer for 20+ minutes; historical pagination must remain independent.
+    // A visible delivery failure is only a non-blocking quality warning.
     if (config.responseProcessor === 'chatgpt-thread-json'
-        && ['armed', 'capturing', 'awaiting-scroll', 'ready'].includes(state.phase)) {
-      let stable;
-      try {
-        stable = await guardedGenerationWait('after-reload', currentSettings,
-          state.pass > 1 && (state.completedPasses || 0) >= 1);
-      } catch (error) {
-        // On an optional pass, a full verified earlier pass is a safe fallback.
-        // On the mandatory pass a timeout remains a hard error.
-        if (state.pass > 1 && (state.completedPasses || 0) >= 1) {
-          log.write('CHATGPT_EXTRA_PASS_GENERATION_TIMEOUT', {
-            pass:state.pass, message:error instanceof Error ? error.message : String(error),
-          });
-          const skipped = await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE});
-          state = skipped.state;
-          stable = {observedActive:false};
-        } else throw error;
-      }
-      if (!stable || runtime.aborted) return false;
-      if (stable.deliveryFailed) {
-        log.write('CHATGPT_EXTRA_PASS_DELIVERY_FAILURE_DETECTED', {pass:state.pass, stage:'after-reload'});
-        state = (await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE, reason:'delivery-failed'})).state;
-      } else if (stable.observedActive && !hasUnchangedLimitTail(state, 'after-reload')) {
-        if (state.pass > 1 && (state.completedPasses || 0) >= 1 && state.pageState?.pageSequence) {
-          // Reloading again can itself resume an unsuccessful ChatGPT answer.
-          // Never risk a complete main-pass archive to chase an optional pass.
-          log.write('CHATGPT_EXTRA_PASS_GENERATION_DETECTED', {
-            pass:state.pass, completedPasses:state.completedPasses,
-          });
-          const skipped = await sendCaptureMessage({type:CAPTURE_SKIP_EXTRA_PASS_MESSAGE});
-          state = skipped.state;
-        } else if (state.phase !== 'ready' && !state.pageState?.pageSequence) {
-          // No initial page has been accepted, so there is nothing stale to recapture.
-          log.write('CHATGPT_GENERATION_SETTLED_BEFORE_CAPTURE', {pass:state.pass});
-        } else {
-          log.write('CHATGPT_GENERATION_RECAPTURE_REQUIRED', {
-            pass:state.pass, previousRestarts:state.generationRestartCount || 0,
-            reason:'initial-page-may-predate-generation-settle',
-          });
-          const restart = await sendCaptureMessage({type:CAPTURE_GENERATION_RESTART_MESSAGE});
-          if (!restart.ok) throw new Error(restart.error || 'Не удалось обновить историю после генерации.');
-          return true;
-        }
-      }
+        && state.pass === 1 && !state.primaryDeliveryFailureObserved
+        && globalThis.__chatContextExporterGenerationGuard?.hasDeliveryFailure?.(document)) {
+      await notePrimaryDeliveryFailure(state, 'after-reload');
     }
 
     state = await waitForNetworkCaptureState(state, currentSettings, config);
@@ -2346,8 +2315,11 @@
       log.importEntries?.(state.events || []);
       const message = state.error || 'Сетевой захват завершился ошибкой.';
       log.write('ERROR', { message });
-      runtime.panel.setStatus(`Ошибка: ${message}`);
-      runtime.panel.markError();
+      const emergencySaved = await saveEmergencyLimitTailOnFailure(state);
+      if (!emergencySaved) {
+        runtime.panel.setStatus(`Ошибка: ${message}`);
+        runtime.panel.markError();
+      }
       await log.saveOnce('ERROR');
       await sendCaptureMessage({ type: CAPTURE_RELEASE_MESSAGE }).catch(() => {});
       return;
@@ -2422,12 +2394,20 @@
 
     const artifact = buildNetworkMarkdownArtifact(parsed.conversation);
     const completedPasses = Math.max(1, Number(state.completedPasses) || 1);
-    if (state.captureWarning) {
-      log.write('EXPORT_WITH_WARNING', {
-        warning:state.captureWarning, completedPasses, requestedPasses:state.totalPasses,
-      });
-      artifact.content = '> **Предупреждение экспорта:** ' + state.captureWarning + '\n\n' + artifact.content;
-      runtime.panel.setStatus('Основной проход собран; дополнительная проверка не выполнена.');
+    const exportWarnings = [];
+    if (state.primaryDeliveryFailureObserved || runtime.primaryDeliveryFailureObserved) {
+      exportWarnings.push('ChatGPT показал ошибку доставки последнего ответа. '
+        + 'История собрана до начала по курсорам, но полнота последнего ответа не подтверждена; '
+        + 'расширение не нажимало «Повторить».');
+    }
+    if (state.captureWarning) exportWarnings.push(state.captureWarning);
+    if (Array.isArray(diagnostics.warnings)) exportWarnings.push(...diagnostics.warnings);
+    if (diagnostics.merge) log.write('CHATGPT_PASS_MERGE', diagnostics.merge);
+    if (exportWarnings.length) {
+      const warning = exportWarnings.join(' ');
+      log.write('EXPORT_WITH_WARNING', {warning, completedPasses, requestedPasses:state.totalPasses});
+      artifact.content = '> **Предупреждение экспорта:** ' + warning + '\n\n' + artifact.content;
+      runtime.panel.setStatus('Сбор завершён с предупреждением.');
     }
     const workDurationMs = Date.now() - runtime.startedAt;
     const passAdditions = (diagnostics.passStats || []).map((item) => item.added);
@@ -2449,7 +2429,7 @@
     if (currentSettings.autoSave) {
       runtime.panel.setStatus('Сохраняю файл...');
       await saveMarkdownArtifact(artifact, 'auto', { saveAs: false });
-      runtime.panel.setStatus(state.captureWarning ? 'Сохранено с предупреждением: доп. проход пропущен.' : 'Сохранено.');
+      runtime.panel.setStatus(exportWarnings.length ? 'Сохранено с предупреждением.' : 'Сохранено.');
       runtime.panel.setCloseTitle('Закрыть');
       runtime.panel.markDone();
 
@@ -2481,7 +2461,7 @@
       return;
     }
 
-    runtime.panel.setStatus(state.captureWarning ? 'Сбор завершён с предупреждением.' : 'Сбор завершен.');
+    runtime.panel.setStatus(exportWarnings.length ? 'Сбор завершён с предупреждением.' : 'Сбор завершен.');
     runtime.panel.setCloseTitle('Закрыть');
     runtime.panel.markDone();
     log.write('WAITING_FOR_SAVE_DECISION', {
