@@ -52,6 +52,7 @@ function createHarness({pageInfoList=pages} = {}) {
     paginationMode:'scroll-up-until-start',responseProcessor:'chatgpt-thread-json',
     requestMethod:'GET',requestResourceType:null,
     pass:1,totalPasses:1,attemptEpoch:1,phase:'capturing',
+    retryMaxAttempts:5,retryBaseSeconds:5,
     minDelayMs:100,maxDelayMs:1000,timeoutMs:180000,
     pageState:null,pagesCapturedInPass:0,currentPassCaptured:false,
     currentPassTranscriptIds:new Set(),seenPageStartCursors:new Set(),acceptedRequestBeforeCursors:new Set(),bufferedPages:new Map(),

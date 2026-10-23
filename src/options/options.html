@@ -70,13 +70,13 @@
       <div class="grid">
         <label>
           <span>Количество повторов</span>
-          <input id="errorRetryCount" type="number" min="1" max="10" step="1">
-          <small>От 1 до 10, по умолчанию 5.</small>
+          <input id="errorRetryCount" type="number" min="1" max="25" step="1">
+          <small>От 1 до 25, по умолчанию 10.</small>
         </label>
         <label>
           <span>Базовое ожидание, секунд</span>
           <input id="errorRetryBaseSeconds" type="number" min="1" max="60" step="1">
-          <small>От 1 до 60, по умолчанию 5: 5, 10, 15, 20, 25 с.</small>
+          <small>От 1 до 60, по умолчанию 10: 10, 20, 30, 40, 50 с и далее.</small>
         </label>
       </div>
     </section>
@@ -94,7 +94,7 @@
 
     <section class="card">
       <h2>Задержки</h2>
-      <p class="hint">Случайная задержка между последовательными шагами прокрутки или повторными проходами, когда они используются адаптером.</p>
+      <p class="hint">Случайная задержка между последовательными шагами прокрутки или повторными проходами. По умолчанию 3000–5000 мс (3–5 секунд); разрешён минимум 100 мс, но короткие задержки могут повышать вероятность HTTP 429.</p>
 
       <div class="grid">
         <label>

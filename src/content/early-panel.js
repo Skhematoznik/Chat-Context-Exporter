@@ -39,7 +39,7 @@
     if (!state) return 'Загружаю страницу и восстанавливаю статус экспорта...';
     if (state.phase === 'waiting-http-retry') {
       const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
-      return `Ошибка ${state.httpRetryStatus || 'загрузки'}: повтор ${state.httpRetryCount || 0} из ${state.retryMaxAttempts || 5} через ${remaining} с.`;
+      return `Ошибка ${state.httpRetryStatus || 'загрузки'}: повтор ${state.httpRetryCount || 0} из ${state.retryMaxAttempts || 10} через ${remaining} с.`;
     }
     if (state.phase === 'waiting-next-pass') return 'Подготовка дополнительного прохода...';
     if (state.phase === 'ready') return 'Сбор завершён. Проверяю данные...';
@@ -59,6 +59,7 @@
     }
     ui.timer.textContent = clock(Date.now() - startedAt);
     ui.status.textContent = statusFor(lastState);
+    ui.rateLimitHint.hidden = lastState?.sawHttp429 !== true;
     if (lastState) {
       ui.pass.textContent = `${Math.max(1, lastState.pass || 1)} / ${Math.max(1, lastState.totalPasses || 1)}`;
       ui.pages.textContent = String(lastState.pageState?.pageSequence || lastState.capturesCompleted || 0);
@@ -128,6 +129,8 @@
         .body { padding: 12px; font: 13px/1.45 Arial, sans-serif; }
         .timer { font-weight: 700; font-variant-numeric: tabular-nums; margin-bottom: 8px; }
         .status { margin: 0 0 10px; }
+        .rate-limit-hint { margin: 0 0 10px; color: #ffdb8b; font-size: 12px; line-height: 1.4; }
+        .rate-limit-hint[hidden] { display: none; }
         .meta { color: #cfcfd5; font-size: 12px; }
         .meta span { color: #fff; }
         .progress {
@@ -160,6 +163,7 @@
         <div class="body">
           <div class="timer">Время: <span class="elapsed">00:00:00</span></div>
           <p class="status">Страница загружается. Экспорт работает...</p>
+          <p class="rate-limit-hint" hidden>HTTP 429: увеличьте задержку прокрутки в настройках.</p>
           <div class="meta">Проход: <span class="pass">1 / 1</span>
             · Страниц: <span class="pages">0</span>
             · Сообщений: <span class="messages">0</span></div>
@@ -169,6 +173,7 @@
     document.documentElement.appendChild(host);
     ui = {
       timer: root.querySelector('.elapsed'), status: root.querySelector('.status'),
+      rateLimitHint: root.querySelector('.rate-limit-hint'),
       pass: root.querySelector('.pass'), pages: root.querySelector('.pages'),
       messages: root.querySelector('.messages'),
     };

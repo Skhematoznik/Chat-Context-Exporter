@@ -133,6 +133,8 @@
           font-weight: 700;
         }
         .status { margin: 0 0 10px; font-size: 13px; line-height: 1.45; }
+        .rate-limit-hint { margin: 0 0 10px; font-size: 12px; line-height: 1.4; color: #ffdb8b; }
+        .rate-limit-hint[hidden] { display: none; }
         .meta {
           display: grid;
           grid-template-columns: auto 1fr;
@@ -201,6 +203,7 @@
         <div class="body">
           <div class="timer">Время: <span class="elapsed">00:00:00</span></div>
           <p class="status">Подготовка...</p>
+          <p class="rate-limit-hint" hidden>HTTP 429: увеличьте задержку прокрутки в настройках.</p>
           <div class="meta">
             <div class="meta-row" data-meta-field="assistant"><span>Чат:</span><span class="value assistant">определение</span></div>
             <div class="meta-row" data-meta-field="method"><span>Метод:</span><span class="value method">определение</span></div>
@@ -224,6 +227,7 @@
     const closeButton = shadow.querySelector('.close');
     const elapsed = shadow.querySelector('.elapsed');
     const status = shadow.querySelector('.status');
+    const rateLimitHint = shadow.querySelector('.rate-limit-hint');
     const assistant = shadow.querySelector('.assistant');
     const method = shadow.querySelector('.method');
     const messages = shadow.querySelector('.messages');
@@ -291,6 +295,7 @@
         );
       },
       setStatus(text) { status.textContent = text; },
+      setRateLimitWarning(visible) { rateLimitHint.hidden = !visible; },
       setAssistant(text) { assistant.textContent = text; },
       setMethod(text) { method.textContent = text; },
       setFieldVisible(field, visible) {

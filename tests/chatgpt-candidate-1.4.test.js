@@ -54,13 +54,13 @@ test('1.4: options expose exact two error settings and defaults; Stop remains st
   const context=vm.createContext({__chatContextExporter:app,chrome:{storage:{local:{get:async()=>({})}}}});
   vm.runInContext(read('src/core/settings.js'),context);
   const settings=app.modules.settings;
-  assert.equal(settings.DEFAULT_SETTINGS.errorRetryCount,5);
-  assert.equal(settings.DEFAULT_SETTINGS.errorRetryBaseSeconds,5);
-  assert.equal(settings.clampErrorRetryCount(15),10);
+  assert.equal(settings.DEFAULT_SETTINGS.errorRetryCount,10);
+  assert.equal(settings.DEFAULT_SETTINGS.errorRetryBaseSeconds,10);
+  assert.equal(settings.clampErrorRetryCount(30),25);
   assert.equal(settings.clampErrorRetryCount(0),1);
   assert.equal(settings.clampErrorRetryBaseSeconds(99),60);
   assert.equal(settings.clampErrorRetryBaseSeconds(0),1);
-  assert.match(read('src/options/options.html'),/id="errorRetryCount" type="number" min="1" max="10"/);
+  assert.match(read('src/options/options.html'),/id="errorRetryCount" type="number" min="1" max="25"/);
   assert.match(read('src/options/options.html'),/id="errorRetryBaseSeconds" type="number" min="1" max="60"/);
   const content=read('src/content/start.js');
   assert.match(content,/config\.responseProcessor === 'chatgpt-thread-json' && isChatGptGenerating\(\)/);

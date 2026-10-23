@@ -13,10 +13,10 @@
     extraPassesEnabled: false,
     extraPassCount: 1,
     generationWaitSeconds: 300,
-    errorRetryCount: 5,
-    errorRetryBaseSeconds: 5,
-    minDelayMs: 100,
-    maxDelayMs: 1000,
+    errorRetryCount: 10,
+    errorRetryBaseSeconds: 10,
+    minDelayMs: 3000,
+    maxDelayMs: 5000,
   });
 
   function clampDelay(value, fallback) {
@@ -45,7 +45,7 @@
 
   function clampErrorRetryCount(value, fallback = DEFAULT_SETTINGS.errorRetryCount) {
     const number = Number(value);
-    return Number.isFinite(number) ? Math.min(10, Math.max(1, Math.round(number))) : fallback;
+    return Number.isFinite(number) ? Math.min(25, Math.max(1, Math.round(number))) : fallback;
   }
 
   function clampErrorRetryBaseSeconds(value, fallback = DEFAULT_SETTINGS.errorRetryBaseSeconds) {

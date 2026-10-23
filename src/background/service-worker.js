@@ -66,8 +66,8 @@ const SAVE_REQUEST_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_CAPTURE_TIMEOUT_MS = 60_000;
 // Shared, operator-configured linear backoff for relevant HTTP statuses and
 // recoverable cursor/timeout failures. Counts are per pass, not per status.
-const CHATGPT_RETRY_DEFAULT_COUNT = 5;
-const CHATGPT_RETRY_DEFAULT_BASE_SECONDS = 5;
+const CHATGPT_RETRY_DEFAULT_COUNT = 10;
+const CHATGPT_RETRY_DEFAULT_BASE_SECONDS = 10;
 const CHATGPT_CURSOR_GAP_TIMEOUT_MS = 15000;
 const CHATGPT_MAX_BUFFERED_PAGES = 24;
 const CHATGPT_MAX_BUFFERED_PAGE_BYTES = 24 * 1024 * 1024;
@@ -304,6 +304,7 @@ function serializeCaptureSession(session, { includeCaptures = false, includeEven
     retryMaxAttempts: session.retryMaxAttempts || CHATGPT_RETRY_DEFAULT_COUNT,
     retryBaseSeconds: session.retryBaseSeconds || CHATGPT_RETRY_DEFAULT_BASE_SECONDS,
     httpRetryStatus: session.httpRetryStatus || null,
+    sawHttp429: session.sawHttp429 === true,
     httpRetryAt: session.httpRetryAt || null,
     http429CheckpointPages: session.http429Checkpoint?.length || 0,
     http500RetryCount: session.http500RetryCount || 0,
@@ -798,10 +799,20 @@ async function handleCaptureHttpError(session, requestId, requestInfo) {
   const status = Number(requestInfo.status);
   const requestBefore = getRequestBeforeCursor(requestInfo.url);
   const isChatGptPage = isCurrentChatGptThreadPageRequest(session, requestInfo);
+  // A rate limit on a duplicate initial request is still relevant to the operator,
+  // but must not restart an otherwise healthy cursor chain.
+  const firstRateLimit = status === 429 && session.sawHttp429 !== true;
+  if (firstRateLimit) {
+    session.sawHttp429 = true;
+    appendCaptureEvent(session, 'CHATGPT_HTTP_429_SCROLL_DELAY_ADVICE', {
+      pass: session.pass, expectedCursorRequest: isChatGptPage,
+    });
+  }
   if (session.responseProcessor === 'chatgpt-thread-json' && !isChatGptPage) {
     appendCaptureEvent(session, 'CHATGPT_THREAD_RESPONSE_SKIPPED', {
       pass: session.pass, requestId, reason: 'http-error-outside-current-cursor-chain', status,
     });
+    if (firstRateLimit) await notifyCaptureSession(session);
     return;
   }
   appendCaptureEvent(session, 'NETWORK_HTTP_ERROR', {
@@ -1276,8 +1287,8 @@ async function startCaptureSession(tabId, message) {
   }
 
   const totalPasses = clampInteger(message.totalPasses, 1, 4, 1);
-  const minDelayMs = clampInteger(message.minDelayMs, 100, 60_000, 100);
-  const maxDelayMs = clampInteger(message.maxDelayMs, 100, 60_000, 1000);
+  const minDelayMs = clampInteger(message.minDelayMs, 100, 60_000, 3000);
+  const maxDelayMs = clampInteger(message.maxDelayMs, 100, 60_000, 5000);
   const timeoutMs = clampInteger(
     message.timeoutMs,
     10_000,
@@ -1357,7 +1368,7 @@ async function startCaptureSession(tabId, message) {
     currentPassTranscriptIds: new Set(),
     attemptEpoch: 0,
     httpRetryCount: 0,
-    retryMaxAttempts: clampInteger(message.settings?.errorRetryCount ?? message.errorRetryCount, 1, 10, CHATGPT_RETRY_DEFAULT_COUNT),
+    retryMaxAttempts: clampInteger(message.settings?.errorRetryCount ?? message.errorRetryCount, 1, 25, CHATGPT_RETRY_DEFAULT_COUNT),
     retryBaseSeconds: clampInteger(message.settings?.errorRetryBaseSeconds ?? message.errorRetryBaseSeconds, 1, 60, CHATGPT_RETRY_DEFAULT_BASE_SECONDS),
     http403RetryCount: 0,
     http429RetryCount: 0,
@@ -1365,6 +1376,7 @@ async function startCaptureSession(tabId, message) {
     http500RetryCount: 0,
     http500Checkpoint: null,
     httpRetryStatus: null,
+    sawHttp429: false,
     httpRetryAt: null,
     matchedRequests: 0,
     captures: [],

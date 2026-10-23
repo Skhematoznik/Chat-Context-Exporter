@@ -1179,6 +1179,7 @@
     }
 
     runtime.panel.setPass(Math.max(1, state.pass || 1), Math.max(1, state.totalPasses || 1));
+    runtime.panel.setRateLimitWarning?.(state.sawHttp429 === true);
     if (Number.isFinite(Number(state.pageState?.transcriptMessagesInPass))) {
       runtime.panel.setMessageCount(Number(state.pageState.transcriptMessagesInPass));
     }
@@ -1198,7 +1199,7 @@
         break;
       case 'waiting-http-retry': {
         const remaining = Math.max(0, Math.ceil(((state.httpRetryAt || Date.now()) - Date.now()) / 1000));
-        runtime.panel.setStatus(`Ошибка ${state.httpRetryStatus || 'загрузки'}: повтор ${state.httpRetryCount || 0} из ${state.retryMaxAttempts || 5} через ${remaining} с.`);
+        runtime.panel.setStatus(`Ошибка ${state.httpRetryStatus || 'загрузки'}: повтор ${state.httpRetryCount || 0} из ${state.retryMaxAttempts || 10} через ${remaining} с.`);
         break;
       }
       case 'waiting-next-pass':

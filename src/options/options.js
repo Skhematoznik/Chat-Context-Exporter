@@ -7,10 +7,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   extraPassesEnabled: false,
   extraPassCount: 1,
   generationWaitSeconds: 300,
-  errorRetryCount: 5,
-  errorRetryBaseSeconds: 5,
-  minDelayMs: 100,
-  maxDelayMs: 1000,
+  errorRetryCount: 10,
+  errorRetryBaseSeconds: 10,
+  minDelayMs: 3000,
+  maxDelayMs: 5000,
 });
 
 const SETTING_KEYS = Object.freeze(Object.keys(DEFAULT_SETTINGS));
@@ -83,7 +83,7 @@ function normalizeStoredSettings(stored) {
       : DEFAULT_SETTINGS.extraPassesEnabled,
     extraPassCount: readExtraPassCount(stored.extraPassCount),
     generationWaitSeconds: clampNumber(stored.generationWaitSeconds, 30, 3600, DEFAULT_SETTINGS.generationWaitSeconds),
-    errorRetryCount: clampNumber(stored.errorRetryCount, 1, 10, DEFAULT_SETTINGS.errorRetryCount),
+    errorRetryCount: clampNumber(stored.errorRetryCount, 1, 25, DEFAULT_SETTINGS.errorRetryCount),
     errorRetryBaseSeconds: clampNumber(stored.errorRetryBaseSeconds, 1, 60, DEFAULT_SETTINGS.errorRetryBaseSeconds),
     minDelayMs: readDelayValue(stored.minDelayMs, DEFAULT_SETTINGS.minDelayMs),
     maxDelayMs: readDelayValue(stored.maxDelayMs, DEFAULT_SETTINGS.maxDelayMs),
@@ -209,7 +209,7 @@ function attachHandlers() {
       max: 3600,
       fallback: DEFAULT_SETTINGS.generationWaitSeconds,
     }],
-    ['errorRetryCount', elements.errorRetryCount, { min: 1, max: 10, fallback: DEFAULT_SETTINGS.errorRetryCount }],
+    ['errorRetryCount', elements.errorRetryCount, { min: 1, max: 25, fallback: DEFAULT_SETTINGS.errorRetryCount }],
     ['errorRetryBaseSeconds', elements.errorRetryBaseSeconds, { min: 1, max: 60, fallback: DEFAULT_SETTINGS.errorRetryBaseSeconds }],
     ['extraPassCount', elements.extraPassCount, {
       min: 1,
